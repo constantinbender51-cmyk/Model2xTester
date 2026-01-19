@@ -40,7 +40,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
         pass
 
 def start_server():
-    server_address = ('', HTTP_PORT)
+    server_address = ('0.0.0.0', HTTP_PORT)
     httpd = HTTPServer(server_address, MetricsHandler)
     print(f"\n[SERVER] Serving metrics at http://localhost:{HTTP_PORT}")
     httpd.serve_forever()
