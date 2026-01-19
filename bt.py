@@ -22,13 +22,10 @@ class ETHModel:
         self.best_a = 0.01
         self.github_owner = "constantinbender51-cmyk"
         self.github_repo = "Models"
-        # path for local caching
         self.data_path = "/app/data/eth_ohlc.csv"
 
     def fetch(self):
         """Fetch ohlc eth 1h binance all data, save/load from local path"""
-        
-        # 1. Try to load from local file first
         if os.path.exists(self.data_path):
             print(f"Loading data from {self.data_path}...")
             try:
@@ -39,7 +36,6 @@ class ETHModel:
             except Exception as e:
                 print(f"Error loading cache: {e}. Re-fetching...")
 
-        # 2. Fetch from Binance if no cache or error
         print("Fetching ETH/USDT 1h data from Binance. This may take a minute...")
         exchange = ccxt.binance()
         symbol = 'ETH/USDT'
@@ -69,9 +65,7 @@ class ETHModel:
         self.df.sort_values('timestamp', inplace=True)
         print(f"\nTotal data fetched: {len(self.df)} rows.")
         
-        # 3. Save to local path
         try:
-            # Create directory if it doesn't exist
             os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
             self.df.to_csv(self.data_path, index=False)
             print(f"Saved data to {self.data_path}")
@@ -90,10 +84,8 @@ class ETHModel:
         start_price = prices[0] if prices[0] != 0 else 1
         normalized = prices / start_price
         
-        # Round to floor where a is step
         discretized = np.floor((normalized + 1e-9) / a) * a
         
-        # Split 80/20
         split_idx = int(len(discretized) * 0.8)
         self.train_data = discretized[:split_idx]
         self.test_data = discretized[split_idx:]
@@ -101,13 +93,12 @@ class ETHModel:
         return self.train_data, self.test_data
 
     def upload(self, plt_obj, filename):
-        """Save plot to GitHub via API (supports folder paths like 'plot/plot.png')"""
+        """Save plot to GitHub via API"""
         token = os.getenv('PAT')
         if not token:
             print("Error: PAT not found in .env")
             return
 
-        # Save plot to buffer
         buf = io.BytesIO()
         plt_obj.savefig(buf, format='png', dpi=150)
         buf.seek(0)
@@ -119,7 +110,6 @@ class ETHModel:
             "Accept": "application/vnd.github.v3+json"
         }
         
-        # Check if file exists to get SHA
         try:
             get_resp = requests.get(url, headers=headers)
             data = {
@@ -213,18 +203,25 @@ class ETHModel:
         count_pnl_lt_neg_a = 0
         cumulative_pnl = [0]
         
+        # New counters
+        total_predictions = 0
+        flat_predictions = 0
+        
         for i in range(len(test_final) - 5):
             current_seq = test_final[i : i+5]
             current_price = test_final[i+4]
             actual_next = test_final[i+5]
             
             predicted_next = self.pred(current_seq)
+            total_predictions += 1
             
             direction = 0
             if predicted_next > current_price + 1e-9:
                 direction = 1
             elif predicted_next < current_price - 1e-9:
                 direction = -1
+            else:
+                flat_predictions += 1
                 
             trade_pnl = (actual_next - current_price) * direction
             pnls.append(trade_pnl)
@@ -241,6 +238,8 @@ class ETHModel:
             accuracy = count_pnl_gt_a / denominator
             
         print(f"Results on Test Data: Accuracy={accuracy:.2%}, Wins={count_pnl_gt_a}, Losses={count_pnl_lt_neg_a}")
+        print(f"Total Predictions: {total_predictions}")
+        print(f"Flat Predictions (No Trade): {flat_predictions}")
         
         plt.figure(figsize=(12, 6))
         plt.plot(cumulative_pnl, label='Cumulative PnL', color='green')
@@ -250,7 +249,6 @@ class ETHModel:
         plt.legend()
         plt.grid(True)
         
-        # Save PnL plot to plot/pnl.png
         self.upload(plt, "plot/pnl.png")
         plt.close()
 
@@ -258,7 +256,6 @@ class ETHModel:
         self.fetch()
         if self.df is None or len(self.df) == 0: return
 
-        # Plot ALL Data
         print("\nGenerating plot of all data...")
         viz_a = 0.01 
         train_viz, test_viz = self.prepare(viz_a)
@@ -272,7 +269,6 @@ class ETHModel:
         plt.legend()
         plt.grid(True)
         
-        # Save data plot to plot/plot.png
         self.upload(plt, "plot/plot.png")
         plt.close()
         
