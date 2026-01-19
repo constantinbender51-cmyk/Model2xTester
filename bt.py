@@ -12,13 +12,13 @@ from io import BytesIO
 DATA_PATH = "/app/data/"
 FILE_NAME = "eth_1h_data.csv"
 REPO_NAME = "constantinbender51-cmyk/Models"
-REMOTE_PLOT_PATH = "plot/plot.png"
+REMOTE_PLOT_PATH = "plot.png"
 A = 0.01
 
 def fetch():
     """
     Fetches 1h ETH/USDT OHLC data from Binance. 
-    Loads from local cache if present, otherwise fetches full history.
+    Loads from local cache if present.
     """
     if not os.path.exists(DATA_PATH):
         os.makedirs(DATA_PATH)
@@ -28,7 +28,6 @@ def fetch():
     if os.path.exists(file_path):
         print(f"Loading data from {file_path}")
         df = pd.read_csv(file_path)
-        # Ensure timestamp is correct type if needed, usually csv loads as int/float or string
         return df
 
     print("Fetching data from Binance...")
@@ -36,10 +35,8 @@ def fetch():
     symbol = 'ETH/USDT'
     timeframe = '1h'
     
-    # Binance limits fetch per call; pagination required for "all data"
-    # Using a simplified since-based fetch
     all_ohlcv = []
-    since = exchange.parse8601('2017-08-17T00:00:00Z') # Approximate ETH listing
+    since = exchange.parse8601('2017-08-17T00:00:00Z') 
     now = exchange.milliseconds()
     
     while since < now:
@@ -56,23 +53,24 @@ def fetch():
             
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df.to_csv(file_path, index=False)
-    print(f"\nData saved to {file_path}")
     return df
 
 def prepare(df):
     """
-    Normalizes close price to first close, discretizes by floor(a=0.01),
-    splits 80/20, and generates a plot.
+    Normalizes close price, discretizes by floor(a), and explicitly rounds 
+    to remove floating point artifacts.
     """
-    # Keep only close
     prices = df['close'].values
     
     # Normalize
     normalized = prices / prices[0]
     
-    # Floor round to nearest A (0.01)
-    # Formula: floor(value / step) * step
-    discretized = np.floor(normalized / A) * A
+    # Calculate required precision based on A (e.g., 0.01 -> 2 decimals)
+    precision = int(abs(math.log10(A)))
+    
+    # Floor round to nearest A, then strictly round to precision to fix float artifacts
+    # Formula: round(floor(value / step) * step, precision)
+    discretized = np.round(np.floor(normalized / A) * A, precision)
     
     # Split 80/20
     split_idx = int(len(discretized) * 0.8)
@@ -86,7 +84,6 @@ def prepare(df):
     plt.title('ETH 1h Normalized/Discretized Data')
     plt.legend()
     
-    # Save plot to buffer for upload
     buf = BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
@@ -95,9 +92,6 @@ def prepare(df):
     return train_data, test_data, buf
 
 def upload(image_buffer, repo_name, file_path):
-    """
-    Uploads the image buffer to the specified GitHub repository.
-    """
     load_dotenv()
     token = os.getenv("PAT")
     
@@ -106,36 +100,30 @@ def upload(image_buffer, repo_name, file_path):
         return
 
     g = Github(token)
-    
     try:
         repo = g.get_repo(repo_name)
         content = image_buffer.getvalue()
-        
         try:
-            # Check if file exists to update
             contents = repo.get_contents(file_path)
             repo.update_file(contents.path, "Update plot", content, contents.sha)
             print(f"Plot updated at https://github.com/{repo_name}/{file_path}")
         except:
-            # Create new file if not exists
             repo.create_file(file_path, "Initial plot upload", content)
             print(f"Plot created at https://github.com/{repo_name}/{file_path}")
-            
     except Exception as e:
         print(f"Upload failed: {e}")
 
 def map_sequences(data, input_len=5):
     """
-    Maps sequences of length (input_len) to the next value (sequence of 6).
-    Returns a dictionary of probabilities.
-    Structure: { (v1,v2,v3,v4,v5): { next_val1: prob, next_val2: prob } }
+    Maps sequences of length 5 to the next value.
+    Ensures keys are standard Python floats to avoid numpy type representation issues.
     """
     sequences = {}
     
-    # Create windows of 6 (5 input + 1 target)
     for i in range(len(data) - input_len):
-        seq = tuple(data[i:i+input_len]) # Key must be hashable
-        target = data[i+input_len]
+        # Convert numpy types to standard python floats for clean tuples
+        seq = tuple(float(x) for x in data[i:i+input_len])
+        target = float(data[i+input_len])
         
         if seq not in sequences:
             sequences[seq] = {}
@@ -144,7 +132,6 @@ def map_sequences(data, input_len=5):
             sequences[seq][target] = 0
         sequences[seq][target] += 1
         
-    # Convert counts to probabilities
     model = {}
     for seq, targets in sequences.items():
         total = sum(targets.values())
@@ -153,132 +140,83 @@ def map_sequences(data, input_len=5):
     return model
 
 def pred(input_seq, model):
-    """
-    Takes input tuple of 5. Returns the 6th value with highest probability.
-    Returns None if sequence was not seen in training.
-    """
-    if input_seq in model:
-        # Find key with max value
-        options = model[input_seq]
+    # Ensure input is standard tuple of floats
+    clean_input = tuple(float(x) for x in input_seq)
+    
+    if clean_input in model:
+        options = model[clean_input]
         best_next = max(options, key=options.get)
         return best_next
     return None
 
 def test(test_data, model):
-    """
-    Tests on test data.
-    Calculates PnL and the specific accuracy metric requested.
-    Saves a result plot locally (since remote upload was done in prepare, 
-    but logic can be reused).
-    """
     input_len = 5
     pnl_history = []
     hits = 0
     misses = 0
-    ignored = 0 # -a < pnl < a
     
-    predictions = []
-    actuals = []
-
-    # Iterate through test set
     for i in range(len(test_data) - input_len):
-        current_seq = tuple(test_data[i:i+input_len])
-        actual_next = test_data[i+input_len]
-        current_price = current_seq[-1]
+        current_seq = test_data[i:i+input_len]
+        actual_next = float(test_data[i+input_len])
+        current_price = float(current_seq[-1])
         
         predicted_next = pred(current_seq, model)
         
         if predicted_next is not None:
-            # Logic: If model predicts, we take that trade? 
-            # Or is PnL based on the accuracy of the prediction?
-            # Standard PnL: (Exit - Entry) / Entry. 
-            # Here: We assume we bought at current_price and sold at actual_next.
-            # But the metric implies we only care if PnL > A. 
-            
-            # Let's define PnL as the difference between Actual Next and Current 
-            # IF the model predicted the correct direction.
-            # However, simpler interpretation: PnL of the *predicted move* vs reality.
-            
-            # Implementation:
-            # We assume a Long strategy if Predicted > Current.
-            # We assume a Short strategy if Predicted < Current.
-            # If Predicted == Current, no trade.
-            
             trade_pnl = 0
             if predicted_next > current_price:
-                # Long
                 trade_pnl = actual_next - current_price 
             elif predicted_next < current_price:
-                # Short
                 trade_pnl = current_price - actual_next
             
             pnl_history.append(trade_pnl)
             
-            # Metric Calculation
             if trade_pnl > A:
                 hits += 1
             elif trade_pnl < -A:
                 misses += 1
-            else:
-                ignored += 1
-                
-            predictions.append(predicted_next)
         else:
-            predictions.append(np.nan) # Unknown state
             pnl_history.append(0)
-        
-        actuals.append(actual_next)
 
-    # Calculate Metric
-    # times pnl > a / (times pnl > a + times pnl < -a)
     denominator = hits + misses
     metric = (hits / denominator) if denominator > 0 else 0
     
     print(f"\n--- Test Results ---")
-    print(f"Total Trades Simulated: {len(pnl_history)}")
-    print(f"PnL > {A}: {hits}")
-    print(f"PnL < -{A}: {misses}")
-    print(f"Metric (Wins / Wins+Losses): {metric:.4f}")
+    print(f"Trades Evaluated: {len(pnl_history)}")
+    print(f"Wins (> {A}): {hits}")
+    print(f"Losses (< -{A}): {misses}")
+    print(f"Accuracy Metric: {metric:.4f}")
     
-    # Plot PnL curve
     cumulative_pnl = np.cumsum(pnl_history)
     plt.figure(figsize=(12, 6))
-    plt.plot(cumulative_pnl, label='Cumulative PnL (Test)')
-    plt.title(f'Strategy PnL (Metric: {metric:.2f})')
+    plt.plot(cumulative_pnl, label='Cumulative PnL')
+    plt.title(f'Strategy PnL (Accuracy: {metric:.2f})')
     plt.legend()
     plt.savefig('test_pnl_plot.png')
-    print("Test PnL plot saved to test_pnl_plot.png")
+    print("Test plot saved locally.")
 
 def main():
-    # 1. Fetch
     df = fetch()
-    
-    # 2. Prepare
     train, test_data, plot_buf = prepare(df)
-    
-    # 3. Upload Plot
     upload(plot_buf, REPO_NAME, REMOTE_PLOT_PATH)
     
-    # 4. Map Sequences
-    print("Mapping sequences (Training)...")
+    print("Mapping sequences...")
     model = map_sequences(train)
     
-    # 5. Example Prediction
-    # Take last 5 from training to predict next
-    sample_input = tuple(train[-5:])
+    # Sample Prediction
+    sample_input = train[-5:]
     prediction = pred(sample_input, model)
     
     print("\n--- Sample Prediction ---")
-    print(f"Input Sequence: {sample_input}")
+    # Clean output for display
+    print(f"Input: {[float(x) for x in sample_input]}")
     if prediction is not None:
-        # Output 6 starting with 5 with highest probability
-        full_sequence = list(sample_input)
-        full_sequence.append(prediction)
-        print(f"Highest Prob 6-Seq: {full_sequence}")
+        full_seq = list(sample_input)
+        full_seq.append(prediction)
+        print(f"Projected 6-Seq: {[float(x) for x in full_seq]}")
     else:
-        print("Sequence not found in training map.")
+        print("Sequence not found.")
 
-    # 6. Test
     test(test_data, model)
 
 if __name__ == "__main__":
