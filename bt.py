@@ -9,24 +9,24 @@ from dotenv import load_dotenv
 
 # 1. Load Environment Variables
 load_dotenv()
-GITHUB_PAT = os.getenv("PAT")  # Ensure your .env key is named GITHUB_PAT or update this
-
-if not GITHUB_PAT:
-    raise ValueError("Error: GITHUB_PAT not found in .env file.")
+GITHUB_PAT = os.getenv("GITHUB_PAT")
 
 # 2. Configuration
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 SYMBOL = "ETHUSDT"
 INTERVAL = "1m"
-START_DATE = "2020-01-01"
+START_DATE = "2022-01-01"  # Updated start date
 END_DATE = "2026-01-01"
 
 # GitHub Config
 REPO_OWNER = "constantinbender51-cmyk"
 REPO_NAME = "Models"
-FILE_PATH = "ohlc/eth1mohlc.csv"
+REMOTE_FILE_PATH = "ohlc/eth1mohlc.csv"
 BRANCH = "main"
-GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
+GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{REMOTE_FILE_PATH}"
+
+# Local Fallback Config
+LOCAL_FILE_PATH = "/app/data/ethohlc1m.csv"
 
 def get_timestamp(date_str):
     return int(datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
@@ -58,17 +58,15 @@ def fetch_binance_data(symbol, interval, start_str, end_str):
                 break
             
             data.extend(klines)
-            
-            # Update start time to the close time of the last candle + 1ms
             last_close_time = klines[-1][6]
             current_start = last_close_time + 1
             
-            # Progress indicator
-            last_date = datetime.fromtimestamp(klines[-1][0]/1000, timezone.utc).strftime('%Y-%m-%d')
-            print(f"\rFetched up to {last_date} | Total rows: {len(data)}", end="", flush=True)
+            # Progress log
+            if len(data) % 100000 == 0:
+                last_date = datetime.fromtimestamp(klines[-1][0]/1000, timezone.utc).strftime('%Y-%m-%d')
+                print(f"Fetched up to {last_date} | Rows: {len(data)}")
             
-            # Rate limit handling (Binance is generous, but safe side)
-            time.sleep(0.1)
+            time.sleep(0.05) 
             
         except Exception as e:
             print(f"\nError fetching data: {e}")
@@ -76,78 +74,86 @@ def fetch_binance_data(symbol, interval, start_str, end_str):
 
     print(f"\nDownload complete. Total rows: {len(data)}")
     
-    # Create DataFrame
-    # Binance columns: Open Time, Open, High, Low, Close, Volume, Close Time, Quote Asset Vol, Trades, Taker Buy Base, Taker Buy Quote, Ignore
     df = pd.DataFrame(data, columns=[
         "timestamp", "open", "high", "low", "close", "volume", 
         "close_time", "qav", "trades", "taker_buy_base", "taker_buy_quote", "ignore"
     ])
     
-    # Keep only relevant OHLCV columns to save space
+    # Filter and Format
     df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-    
-    # Convert types for optimization
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     cols = ["open", "high", "low", "close", "volume"]
     df[cols] = df[cols].astype(float)
-    
-    # Round volume to 3 decimals to reduce CSV string size
     df["volume"] = df["volume"].round(3)
     
     return df
 
+def save_local(df, path):
+    """Saves DataFrame to local path, creating directories if needed."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_csv(path, index=False)
+        print(f"SUCCESS: Saved locally to {path}")
+    except Exception as e:
+        print(f"CRITICAL: Failed to save locally. {e}")
+
 def upload_to_github(df, token, url, branch):
-    # Convert DF to CSV string
+    """Returns True if successful, False if failed."""
+    if not token:
+        print("No GITHUB_PAT found. Skipping upload.")
+        return False
+
+    print("Preparing GitHub upload...")
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
     csv_content = csv_buffer.getvalue()
     
-    # Check size (GitHub Limit is 100MB)
+    # Check size (Limit ~100MB)
     size_mb = len(csv_content.encode('utf-8')) / (1024 * 1024)
-    print(f"CSV Size: {size_mb:.2f} MB")
+    print(f"Payload Size: {size_mb:.2f} MB")
     
     if size_mb > 99:
-        print("WARNING: File exceeds GitHub API 100MB limit. Upload will likely fail.")
-        print("Suggestion: Split the data by year.")
-        return
+        print("Upload rejected: File exceeds GitHub 100MB API limit.")
+        return False
 
-    # Encode to Base64
-    content_encoded = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    # Check if file exists to get SHA (needed for update)
-    get_resp = requests.get(url, headers=headers)
-    sha = None
-    if get_resp.status_code == 200:
-        sha = get_resp.json().get("sha")
-        print("File exists. Updating...")
-    else:
-        print("File does not exist. Creating...")
+    try:
+        # Check for existing file sha
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+        get_resp = requests.get(url, headers=headers)
+        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
 
-    data = {
-        "message": f"Update {SYMBOL} OHLC data {START_DATE} to {END_DATE}",
-        "content": content_encoded,
-        "branch": branch
-    }
-    
-    if sha:
-        data["sha"] = sha
+        # Upload
+        content_encoded = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
+        data = {
+            "message": f"Update {SYMBOL} OHLC {START_DATE}-{END_DATE}",
+            "content": content_encoded,
+            "branch": branch
+        }
+        if sha: data["sha"] = sha
+            
+        response = requests.put(url, headers=headers, json=data)
         
-    response = requests.put(url, headers=headers, json=data)
-    
-    if response.status_code in [200, 201]:
-        print("Successfully uploaded to GitHub.")
-    else:
-        print(f"Failed to upload. Status: {response.status_code}")
-        print(response.json())
+        if response.status_code in [200, 201]:
+            print("SUCCESS: Uploaded to GitHub.")
+            return True
+        else:
+            print(f"GitHub Upload Failed: {response.status_code} - {response.text}")
+            return False
+
+    except Exception as e:
+        print(f"GitHub Upload Exception: {e}")
+        return False
 
 if __name__ == "__main__":
     df = fetch_binance_data(SYMBOL, INTERVAL, START_DATE, END_DATE)
+    
     if not df.empty:
-        upload_to_github(df, GITHUB_PAT, GITHUB_API_URL, BRANCH)
+        # Try GitHub Upload
+        success = upload_to_github(df, GITHUB_PAT, GITHUB_API_URL, BRANCH)
+        
+        # Fallback if upload fails
+        if not success:
+            print("Initiating fallback save...")
+            save_local(df, LOCAL_FILE_PATH)
     else:
         print("No data fetched.")
