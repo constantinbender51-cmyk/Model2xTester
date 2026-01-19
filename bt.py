@@ -1,199 +1,153 @@
 import os
-import ccxt
+import time
+import requests
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+import io
+import base64
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from github import Github
-from io import BytesIO
 
-# Configuration
-DATA_PATH = "/app/data/"
-FILE_NAME = "eth_1h_data.csv"
-REPO_NAME = "constantinbender51-cmyk/Models"
-REMOTE_PLOT_PATH = "plot.png"
+# 1. Load Environment Variables
+load_dotenv()
+GITHUB_PAT = os.getenv("GITHUB_PAT")  # Ensure your .env key is named GITHUB_PAT or update this
 
-# A = 0.01. We scale by 100 to work with natural numbers.
-# Threshold A becomes 1 in the scaled domain.
-SCALE_FACTOR = 50
-A_SCALED = 1 
+if not GITHUB_PAT:
+    raise ValueError("Error: GITHUB_PAT not found in .env file.")
 
-def fetch():
-    if not os.path.exists(DATA_PATH):
-        os.makedirs(DATA_PATH)
+# 2. Configuration
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+SYMBOL = "ETHUSDT"
+INTERVAL = "1m"
+START_DATE = "2020-01-01"
+END_DATE = "2026-01-01"
+
+# GitHub Config
+REPO_OWNER = "constantinbender51-cmyk"
+REPO_NAME = "Models"
+FILE_PATH = "ohlc/eth1mohlc.csv"
+BRANCH = "main"
+GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
+
+def get_timestamp(date_str):
+    return int(datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+def fetch_binance_data(symbol, interval, start_str, end_str):
+    start_ts = get_timestamp(start_str)
+    end_ts = get_timestamp(end_str)
     
-    file_path = os.path.join(DATA_PATH, FILE_NAME)
+    data = []
+    current_start = start_ts
     
-    if os.path.exists(file_path):
-        print(f"Loading data from {file_path}")
-        return pd.read_csv(file_path)
-
-    print("Fetching data from Binance...")
-    exchange = ccxt.binance()
-    all_ohlcv = []
-    since = exchange.parse8601('2017-08-17T00:00:00Z') 
-    now = exchange.milliseconds()
+    print(f"Fetching {symbol} {interval} data from {start_str} to {end_str}...")
     
-    while since < now:
+    while current_start < end_ts:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": current_start,
+            "endTime": end_ts,
+            "limit": 1000
+        }
+        
         try:
-            ohlcv = exchange.fetch_ohlcv('ETH/USDT', '1h', since, limit=1000)
-            if not ohlcv:
-                break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            print(f"Fetched up to {pd.to_datetime(ohlcv[-1][0], unit='ms')}", end='\r')
-        except Exception:
-            break
+            response = requests.get(BINANCE_URL, params=params)
+            response.raise_for_status()
+            klines = response.json()
             
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df.to_csv(file_path, index=False)
+            if not klines:
+                break
+            
+            data.extend(klines)
+            
+            # Update start time to the close time of the last candle + 1ms
+            last_close_time = klines[-1][6]
+            current_start = last_close_time + 1
+            
+            # Progress indicator
+            last_date = datetime.fromtimestamp(klines[-1][0]/1000, timezone.utc).strftime('%Y-%m-%d')
+            print(f"\rFetched up to {last_date} | Total rows: {len(data)}", end="", flush=True)
+            
+            # Rate limit handling (Binance is generous, but safe side)
+            time.sleep(0.1)
+            
+        except Exception as e:
+            print(f"\nError fetching data: {e}")
+            break
+
+    print(f"\nDownload complete. Total rows: {len(data)}")
+    
+    # Create DataFrame
+    # Binance columns: Open Time, Open, High, Low, Close, Volume, Close Time, Quote Asset Vol, Trades, Taker Buy Base, Taker Buy Quote, Ignore
+    df = pd.DataFrame(data, columns=[
+        "timestamp", "open", "high", "low", "close", "volume", 
+        "close_time", "qav", "trades", "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+    
+    # Keep only relevant OHLCV columns to save space
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+    
+    # Convert types for optimization
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    cols = ["open", "high", "low", "close", "volume"]
+    df[cols] = df[cols].astype(float)
+    
+    # Round volume to 3 decimals to reduce CSV string size
+    df["volume"] = df["volume"].round(3)
+    
     return df
 
-def prepare(df):
-    """
-    1. Normalize to first close.
-    2. Multiply by 100 (1/0.01).
-    3. Floor to integer.
-    """
-    prices = df['close'].values
-    normalized = prices / prices[0]
+def upload_to_github(df, token, url, branch):
+    # Convert DF to CSV string
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_content = csv_buffer.getvalue()
     
-    # Scale and Floor: 1.05 -> 105.0 -> 105
-    # This represents 'rounding to a floor where a is 0.01' but in integer space
-    natural_numbers = np.floor(normalized * SCALE_FACTOR).astype(int)
+    # Check size (GitHub Limit is 100MB)
+    size_mb = len(csv_content.encode('utf-8')) / (1024 * 1024)
+    print(f"CSV Size: {size_mb:.2f} MB")
     
-    # Split
-    split_idx = int(len(natural_numbers) * 0.8)
-    train_data = natural_numbers[:split_idx]
-    test_data = natural_numbers[split_idx:]
-    
-    # Plotting (Display as float for readability)
-    plt.figure(figsize=(12, 6))
-    plt.plot(natural_numbers / SCALE_FACTOR, label='Normalized & Floored Price')
-    plt.axvline(x=split_idx, color='r', linestyle='--', label='Train/Test Split')
-    plt.title('ETH 1h Data (Step 0.01)')
-    plt.legend()
-    
-    buf = BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-    
-    return train_data, test_data, buf
+    if size_mb > 99:
+        print("WARNING: File exceeds GitHub API 100MB limit. Upload will likely fail.")
+        print("Suggestion: Split the data by year.")
+        return
 
-def upload(image_buffer, repo_name, file_path):
-    load_dotenv()
-    token = os.getenv("PAT")
-    if not token: return
-
-    g = Github(token)
-    try:
-        repo = g.get_repo(repo_name)
-        content = image_buffer.getvalue()
-        try:
-            contents = repo.get_contents(file_path)
-            repo.update_file(contents.path, "Update plot", content, contents.sha)
-        except:
-            repo.create_file(file_path, "Initial plot upload", content)
-    except Exception as e:
-        print(f"Upload error: {e}")
-
-def map_sequences(data, input_len=5):
-    sequences = {}
+    # Encode to Base64
+    content_encoded = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
     
-    # Data is already pure integers, no float artifacts
-    for i in range(len(data) - input_len):
-        seq = tuple(data[i:i+input_len])
-        target = data[i+input_len]
-        
-        if seq not in sequences:
-            sequences[seq] = {}
-        if target not in sequences[seq]:
-            sequences[seq][target] = 0
-        sequences[seq][target] += 1
-        
-    model = {}
-    for seq, targets in sequences.items():
-        total = sum(targets.values())
-        model[seq] = {k: v / total for k, v in targets.items()}
-    return model
-
-def pred(input_seq, model):
-    if input_seq in model:
-        return max(model[input_seq], key=model[input_seq].get)
-    return None
-
-def test(test_data, model):
-    input_len = 5
-    pnl_history = []
-    hits = 0
-    misses = 0
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
     
-    for i in range(len(test_data) - input_len):
-        current_seq = tuple(test_data[i:i+input_len])
-        actual_next = test_data[i+input_len]
-        current_price = current_seq[-1]
-        
-        predicted_next = pred(current_seq, model)
-        
-        if predicted_next is not None:
-            # PnL logic in integers
-            trade_pnl = 0
-            if predicted_next > current_price:
-                trade_pnl = actual_next - current_price 
-            elif predicted_next < current_price:
-                trade_pnl = current_price - actual_next
-            
-            pnl_history.append(trade_pnl)
-            
-            # Use Scaled A (1)
-            if trade_pnl > A_SCALED:
-                hits += 1
-            elif trade_pnl < -A_SCALED:
-                misses += 1
-        else:
-            pnl_history.append(0)
-
-    denominator = hits + misses
-    metric = (hits / denominator) if denominator > 0 else 0
-    
-    print(f"\n--- Test Results (Scaled Units) ---")
-    print(f"Trades: {len(pnl_history)}")
-    print(f"Wins (> {A_SCALED} unit): {hits}")
-    print(f"Losses (< -{A_SCALED} unit): {misses}")
-    print(f"Accuracy: {metric:.4f}")
-    
-    plt.figure(figsize=(12, 6))
-    plt.plot(np.cumsum(pnl_history), label='Cumulative PnL (Scaled Units)')
-    plt.title(f'Strategy PnL (Accuracy: {metric:.2f})')
-    plt.legend()
-    plt.savefig('test_pnl_plot.png')
-    print("Test plot saved locally.")
-
-def main():
-    df = fetch()
-    train, test_data, plot_buf = prepare(df)
-    upload(plot_buf, REPO_NAME, REMOTE_PLOT_PATH)
-    
-    print("Mapping sequences...")
-    model = map_sequences(train)
-    
-    # Sample Prediction
-    sample_input = tuple(train[-5:])
-    prediction = pred(sample_input, model)
-    
-    print("\n--- Sample Prediction ---")
-    print(f"Input (Int): {list(sample_input)}")
-    if prediction is not None:
-        full_seq = list(sample_input)
-        full_seq.append(prediction)
-        print(f"Output (Int): {full_seq}")
-        # Convert back to float for user reference
-        print(f"Output (Float approx): {[x/SCALE_FACTOR for x in full_seq]}")
+    # Check if file exists to get SHA (needed for update)
+    get_resp = requests.get(url, headers=headers)
+    sha = None
+    if get_resp.status_code == 200:
+        sha = get_resp.json().get("sha")
+        print("File exists. Updating...")
     else:
-        print("Sequence not found.")
+        print("File does not exist. Creating...")
 
-    test(test_data, model)
+    data = {
+        "message": f"Update {SYMBOL} OHLC data {START_DATE} to {END_DATE}",
+        "content": content_encoded,
+        "branch": branch
+    }
+    
+    if sha:
+        data["sha"] = sha
+        
+    response = requests.put(url, headers=headers, json=data)
+    
+    if response.status_code in [200, 201]:
+        print("Successfully uploaded to GitHub.")
+    else:
+        print(f"Failed to upload. Status: {response.status_code}")
+        print(response.json())
 
 if __name__ == "__main__":
-    main()
+    df = fetch_binance_data(SYMBOL, INTERVAL, START_DATE, END_DATE)
+    if not df.empty:
+        upload_to_github(df, GITHUB_PAT, GITHUB_API_URL, BRANCH)
+    else:
+        print("No data fetched.")
