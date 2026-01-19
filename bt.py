@@ -3,13 +3,18 @@ import numpy as np
 import requests
 import time
 from datetime import datetime, timedelta
+from collections import deque
 
-# --- 1. Data Loading & Fetching ---
+# --- CONFIGURATION ---
+SYMBOL = "ETHUSDT"
+HISTORY_DAYS = 5       # Need enough for S1 (2 days ago) + S2 (1 day ago)
+WINDOW = 1440          # 1 Day in minutes
+CSV_PATH = '/app/data/ethohlc1m.csv'
 
+# --- 1. REUSED UTILS (From Previous Steps) ---
 def load_local_data(filepath):
-    print(f"Loading local data from {filepath}...")
+    # (Same as before - simplified for brevity)
     df = pd.read_csv(filepath)
-    # Standardize columns
     df.columns = [c.lower() for c in df.columns]
     rename_map = {c: 'open' for c in df.columns if 'open' in c}
     rename_map.update({c: 'high' for c in df.columns if 'high' in c})
@@ -17,243 +22,243 @@ def load_local_data(filepath):
     rename_map.update({c: 'close' for c in df.columns if 'close' in c})
     rename_map.update({c: 'datetime' for c in df.columns if 'date' in c or 'time' in c})
     df.rename(columns=rename_map, inplace=True)
-    
     if 'datetime' in df.columns:
         df['datetime'] = pd.to_datetime(df['datetime'])
         df.set_index('datetime', inplace=True)
-    df.sort_index(inplace=True)
-    return df
-
-def fetch_binance_data(symbol="ETHUSDT", interval="1m", days=7):
-    """
-    Fetches the last N days of 1m kline data from Binance Public API.
-    """
-    print(f"Fetching last {days} days of {interval} data for {symbol} from Binance...")
-    
-    # Binance API constants
-    base_url = "https://api.binance.com/api/v3/klines"
-    limit = 1000  # Max per request
-    
-    end_time = datetime.utcnow()
-    start_time = end_time - timedelta(days=days)
-    
-    # Convert to milliseconds
-    start_ts = int(start_time.timestamp() * 1000)
-    end_ts = int(end_time.timestamp() * 1000)
-    
-    all_data = []
-    current_start = start_ts
-    
-    while current_start < end_ts:
-        params = {
-            'symbol': symbol,
-            'interval': interval,
-            'startTime': current_start,
-            'endTime': end_ts,
-            'limit': limit
-        }
-        
-        try:
-            r = requests.get(base_url, params=params)
-            r.raise_for_status()
-            data = r.json()
-            
-            if not data:
-                break
-                
-            all_data.extend(data)
-            
-            # Update start time to the last candle's close time + 1ms
-            # data format: [open_time, open, high, low, close, ...]
-            last_open_time = data[-1][0]
-            current_start = last_open_time + 60000 # Advance 1 minute
-            
-            # Rate limit politeness
-            time.sleep(0.1)
-            
-        except Exception as e:
-            print(f"Error fetching data: {e}")
-            break
-            
-    # Convert to DataFrame
-    # Columns: Open Time, Open, High, Low, Close, Volume, Close Time, ...
-    cols = ['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'q_vol', 'trades', 'tb_base', 'tb_quote', 'ignore']
-    df = pd.DataFrame(all_data, columns=cols)
-    
-    # Type conversion
-    df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
-    for c in ['open', 'high', 'low', 'close']:
-        df[c] = df[c].astype(float)
-        
-    df.set_index('datetime', inplace=True)
-    df = df[['open', 'high', 'low', 'close']].sort_index()
-    
-    print(f"Fetched {len(df)} candles.")
-    return df
-
-# --- 2. Processing Logic (Rolling & Discretization) ---
+    return df.sort_index()
 
 def process_candles(df, window=1440):
-    """
-    Applies the '1440 universes' logic:
-    1. Resample to rolling 1D candles (shift open, rolling max/min).
-    2. Normalize (Open=1).
-    3. Discretize Close into 8 bins relative to High-Low.
-    """
-    # 1. Rolling 1D representation
-    # Open is the open from (window-1) minutes ago
-    # High/Low are rolling max/min of window
+    # (Same as before - crucial for state calculation)
     daily = pd.DataFrame(index=df.index)
     daily['close'] = df['close']
     daily['open'] = df['open'].shift(window - 1)
     daily['high'] = df['high'].rolling(window=window).max()
     daily['low'] = df['low'].rolling(window=window).min()
-    
-    # Drop startup NaNs
     daily.dropna(inplace=True)
     
-    # 2. Normalize (Center Open at 1)
+    # Normalize & Discretize
     shift = daily['open'] - 1
     norm_high = daily['high'] - shift
     norm_low = daily['low'] - shift
     norm_close = daily['close'] - shift
     
-    # 3. Discretize
-    rng = norm_high - norm_low
-    rng = rng.replace(0, 1e-9) # Safety
+    rng = (norm_high - norm_low).replace(0, 1e-9)
     section_size = rng / 8
-    
-    # Binning: floor((Close - Low) / SectionSize)
-    bins = ((norm_close - norm_low) / section_size).astype(int)
-    bins = bins.clip(0, 7)
+    bins = ((norm_close - norm_low) / section_size).astype(int).clip(0, 7)
     
     daily['state'] = bins
     daily['norm_low'] = norm_low
     daily['section_size'] = section_size
     
-    # Prepare features for prediction:
-    # We need sequences of states. 
-    # S1 was 2 days ago (T-2880), S2 was 1 day ago (T-1440).
+    # Lagged Features
     daily['s1'] = daily['state'].shift(2880)
     daily['s2'] = daily['state'].shift(1440)
-    daily['prev_close'] = daily['close'].shift(1440)
     
     return daily
 
-# --- 3. Training & Prediction ---
-
 def train_model(train_df):
-    """
-    Builds the probability map from the training set.
-    Map Key: (s1, s2) -> Value: Most frequent next state (target)
-    """
-    print("Training probability map...")
-    # Create triplets (s1, s2) -> target (current state)
-    data = train_df[['s1', 's2', 'state']].dropna().copy()
-    data.columns = ['s1', 's2', 'target']
-    
-    # Count frequency of each target for every (s1, s2) pair
-    counts = data.groupby(['s1', 's2', 'target']).size().reset_index(name='count')
-    
-    # Select the target with the highest count for each pair
+    data = train_df[['s1', 's2', 'state']].dropna()
+    counts = data.groupby(['s1', 's2', 'state']).size().reset_index(name='count')
     best = counts.sort_values('count', ascending=False).drop_duplicates(subset=['s1', 's2'])
-    
-    # Convert to dict for fast lookup
-    prob_map = {}
-    for _, row in best.iterrows():
-        prob_map[(int(row['s1']), int(row['s2']))] = int(row['target'])
-        
-    return prob_map
+    return {(int(row['s1']), int(row['s2'])): int(row['state']) for _, row in best.iterrows()}
 
-def evaluate_model(test_df, prob_map, label="Test Data"):
-    """
-    Runs the prediction logic on a dataset using the provided probability map.
-    """
-    # Filter only valid rows (must have history for s1, s2)
-    valid_df = test_df.dropna(subset=['s1', 's2', 'prev_close']).copy()
+def fetch_recent_history(symbol, days):
+    """Fetches enough history to initialize the rolling windows."""
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(days=days)
+    base_url = "https://api.binance.com/api/v3/klines"
     
-    if len(valid_df) == 0:
-        print(f"[{label}] No valid sequences found (insufficient history?).")
-        return
-
-    results = []
+    all_data = []
+    current_start = int(start_time.timestamp() * 1000)
+    end_ts = int(end_time.timestamp() * 1000)
     
-    for idx, row in valid_df.iterrows():
-        key = (int(row['s1']), int(row['s2']))
-        
-        # 1. Look up prediction
-        if key not in prob_map:
-            continue # Skip unknown sequences
+    print(f"Fetching history since {start_time}...")
+    
+    while current_start < end_ts:
+        params = {'symbol': symbol, 'interval': '1m', 'startTime': current_start, 'limit': 1000}
+        try:
+            r = requests.get(base_url, params=params)
+            data = r.json()
+            if not data: break
+            all_data.extend(data)
+            current_start = data[-1][0] + 60000
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"Fetch error: {e}")
+            break
             
-        pred_bin = prob_map[key]
-        
-        # 2. Determine Predicted Direction
-        # Open is normalized to 1.
-        # Predicted Bin Center (Normalized)
-        pred_center = row['norm_low'] + (pred_bin + 0.5) * row['section_size']
-        
-        # If predicted center > 1 (Open), we predict UP. Else DOWN.
-        pred_dir = 1 if pred_center > 1.0 else -1
-        
-        # 3. Determine Actual Direction
-        actual_ret = (row['close'] - row['prev_close']) / row['prev_close']
-        actual_dir = 1 if actual_ret > 0 else -1
-        
-        # 4. Score
-        is_correct = (pred_dir == actual_dir)
-        pnl = actual_ret if pred_dir == 1 else -actual_ret
-        
-        results.append({'correct': is_correct, 'pnl': pnl})
-        
-    res_df = pd.DataFrame(results)
-    
-    if len(res_df) > 0:
-        accuracy = res_df['correct'].mean()
-        total_pnl = res_df['pnl'].sum()
-        print(f"[{label}] Trades: {len(res_df)} | Accuracy: {accuracy:.2%} | Total PnL: {total_pnl:.4f}")
-    else:
-        print(f"[{label}] No trades executed.")
+    df = pd.DataFrame(all_data, columns=['open_time', 'open', 'high', 'low', 'close', 'v', 'ct', 'qv', 'n', 'tb', 'tq', 'i'])
+    df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
+    for c in ['open', 'high', 'low', 'close']: df[c] = df[c].astype(float)
+    df.set_index('datetime', inplace=True)
+    return df[['open', 'high', 'low', 'close']].sort_index()
 
-# --- 4. Main Execution ---
+# --- 2. LIVE PREDICTOR CLASS ---
+
+class LiveUniversePredictor:
+    def __init__(self, model_map):
+        self.model = model_map
+        # We keep track of the last N minutes of raw data to calculate states on the fly
+        self.raw_history = pd.DataFrame() 
+        # Queue to hold active predictions: (expire_time, direction, predicted_bin)
+        self.active_predictions = deque() 
+        
+    def update_data(self, new_df):
+        """Append new data and maintain buffer size."""
+        # We need at least 3 days (approx 4320 mins) to calculate S1 (2880 ago)
+        self.raw_history = pd.concat([self.raw_history, new_df])
+        self.raw_history = self.raw_history[~self.raw_history.index.duplicated(keep='last')]
+        
+        # Keep buffer manageable (e.g., last 5000 minutes)
+        if len(self.raw_history) > 5000:
+            self.raw_history = self.raw_history.iloc[-5000:]
+            
+    def predict_next(self):
+        """
+        Calculates the state of the universe that just closed (Time T).
+        Predicts the state for Time T + 1440.
+        """
+        # Recalculate indicators on the updated history
+        # (Optimized: In production, we would update incrementally, but pandas is fast enough for 5k rows)
+        processed = process_candles(self.raw_history)
+        
+        # Get the very last row (Time T)
+        current_row = processed.iloc[-1]
+        
+        # We need S1 (T-2880) and S2 (T-1440) relative to T
+        # Wait, the `process_candles` function shifts S1 by 2880 and S2 by 1440.
+        # So `current_row['s1']` IS the state from 2 days ago, and `current_row['s2']` IS the state from 1 day ago.
+        # `current_row['state']` is the state that JUST FINISHED (Time T).
+        
+        # Our Sequence Logic from Training:
+        # Input: S1, S2 -> Target: S3 (Current State)
+        # To Predict Future (T+1440):
+        # We need Input: S_prev (T-1440), S_curr (T).
+        # These correspond to `current_row['s2']` and `current_row['state']`.
+        
+        if pd.isna(current_row['s2']) or pd.isna(current_row['state']):
+            print("Insufficient history to form a sequence.")
+            return
+            
+        input_s1 = int(current_row['s2']) # The state 1440m ago
+        input_s2 = int(current_row['state']) # The state now
+        
+        key = (input_s1, input_s2)
+        
+        if key in self.model:
+            pred_bin = self.model[key]
+            
+            # Interpret Direction
+            # Open of T+1440 will be Close of T (current_row['close'])
+            # Normalized Open = 1.
+            # We predict the shape of T+1440 relative to T+1440's High/Low.
+            # Using current Volatility (section_size) as a proxy for future range properties
+            
+            pred_center_norm = current_row['norm_low'] + (pred_bin + 0.5) * current_row['section_size']
+            
+            # If predicted shape > 1 (Open), Direction is UP
+            direction = 1 if pred_center_norm > 1.0 else -1
+            
+            # Store Prediction
+            expiry = current_row.name + timedelta(minutes=1440)
+            self.active_predictions.append({
+                'created_at': current_row.name,
+                'expiry': expiry,
+                'direction': direction,
+                'bin': pred_bin
+            })
+            
+            print(f"[{current_row.name}] Seq({input_s1}, {input_s2}) -> Pred Bin {pred_bin} (Dir: {direction})")
+        else:
+            print(f"[{current_row.name}] Seq({input_s1}, {input_s2}) -> Unknown Pattern")
+
+    def prune_predictions(self):
+        """Removes predictions that have expired (older than 1440 mins)."""
+        now = self.raw_history.index[-1]
+        
+        # In a real system, we would calculate PnL here by comparing with current price
+        
+        while self.active_predictions and self.active_predictions[0]['expiry'] <= now:
+            expired = self.active_predictions.popleft()
+            # (Optional) Calculate realized PnL of this expired prediction here
+            
+    def get_net_exposure(self):
+        return sum(p['direction'] for p in self.active_predictions)
+
+# --- 3. MAIN EXECUTION LOOP ---
 
 if __name__ == "__main__":
-    # A. Train on Local CSV
+    # A. Train Model
+    print("--- 1. Training Model ---")
     try:
-        raw_df = load_local_data('/app/data/ethohlc1m.csv')
-        
-        # Split 70/30
-        split_idx = int(len(raw_df) * 0.70)
-        train_raw = raw_df.iloc[:split_idx]
-        test_raw = raw_df.iloc[split_idx:]
-        
-        # Process and Train
-        train_processed = process_candles(train_raw)
-        prob_map = train_model(train_processed)
-        print(f"Map learned {len(prob_map)} patterns.")
-        
-        # Test on Local Split
-        test_processed = process_candles(test_raw)
-        evaluate_model(test_processed, prob_map, label="Local CSV Test (30%)")
-        
-    except FileNotFoundError:
-        print("Local CSV not found. Skipping CSV training/testing...")
-        # For demonstration if file is missing, we initialize an empty map or handle error
-        prob_map = {} 
+        raw_train = load_local_data(CSV_PATH)
+        processed_train = process_candles(raw_train)
+        prob_map = train_model(processed_train)
+        print(f"Model Trained. Patterns: {len(prob_map)}")
+    except Exception as e:
+        print(f"Training Failed: {e}")
+        exit()
 
-    # B. Fetch & Test on Live Binance Data
-    print("\n--- Starting Live Data Test ---")
+    # B. Initialize Live System
+    print("\n--- 2. Initializing Live History ---")
+    predictor = LiveUniversePredictor(prob_map)
     
-    # 1. Fetch
-    live_df = fetch_binance_data(symbol="ETHUSDT", interval="1m", days=7)
+    # Load recent history from Binance to "warm up" the state
+    init_df = fetch_recent_history(SYMBOL, HISTORY_DAYS)
+    predictor.update_data(init_df)
+    print(f"History loaded: {len(predictor.raw_history)} candles.")
+
+    # C. Real-Time Loop
+    print("\n--- 3. Starting Live Prediction Loop ---")
+    print("Waiting for synchronization (00s)...")
     
-    if len(live_df) > 3000: # Need at least ~2 days (2880 mins) for one prediction sequence
-        # 2. Process
-        live_processed = process_candles(live_df)
+    while True:
+        now = datetime.now()
         
-        # 3. Evaluate (using the map trained on CSV)
-        if prob_map:
-            evaluate_model(live_processed, prob_map, label="Binance Live Data (Last 7 Days)")
-        else:
-            print("Model was not trained (CSV missing), cannot test on live data.")
-    else:
-        print("Insufficient data fetched from Binance to form sequences.")
+        # Sync to XX:XX:01
+        # Calculate seconds to sleep to reach the next minute's 01s
+        sleep_sec = 60 - now.second + 1
+        if sleep_sec > 60: sleep_sec = 1
+        
+        print(f"Sleeping {sleep_sec}s until next candle...")
+        time.sleep(sleep_sec)
+        
+        # 1. Fetch Latest 1m Candle
+        # We fetch the last 2 minutes to be safe, but we only need the most recently closed one
+        try:
+            # Quick fetch of last 5 candles
+            r = requests.get("https://api.binance.com/api/v3/klines", 
+                             params={'symbol': SYMBOL, 'interval': '1m', 'limit': 5})
+            data = r.json()
+            
+            # Convert to DF
+            cols = ['open_time', 'open', 'high', 'low', 'close', 'v', 'ct', 'qv', 'n', 'tb', 'tq', 'i']
+            new_df = pd.DataFrame(data, columns=cols)
+            new_df['datetime'] = pd.to_datetime(new_df['open_time'], unit='ms')
+            for c in ['open', 'high', 'low', 'close']: new_df[c] = new_df[c].astype(float)
+            new_df.set_index('datetime', inplace=True)
+            
+            # Only keep finalized candles (ignore the currently forming one if returned)
+            # Binance 'close_time' is useful here, or we just trust the timestamp
+            # We want the candle that JUST closed.
+            # If now is 12:05:01, we want the 12:04 candle (which closed at 12:04:59).
+            # The API returns candles by Open Time. The 12:04 candle has Open Time 12:04.
+            
+            # Update predictor
+            predictor.update_data(new_df[['open', 'high', 'low', 'close']])
+            
+            # 2. Prune Old Predictions
+            predictor.prune_predictions()
+            
+            # 3. Predict New Universe
+            predictor.predict_next()
+            
+            # 4. Print Sum
+            net_exp = predictor.get_net_exposure()
+            count = len(predictor.active_predictions)
+            print(f"Active Predictions: {count}/1440 | Net Sum (Direction): {net_exp:+d}")
+            print("-" * 40)
+            
+        except Exception as e:
+            print(f"Error in loop: {e}")
+            time.sleep(10) # Error backoff
