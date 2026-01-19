@@ -1,5 +1,4 @@
 import os
-import math
 import ccxt
 import pandas as pd
 import numpy as np
@@ -13,13 +12,13 @@ DATA_PATH = "/app/data/"
 FILE_NAME = "eth_1h_data.csv"
 REPO_NAME = "constantinbender51-cmyk/Models"
 REMOTE_PLOT_PATH = "plot.png"
-A = 0.01
+
+# A = 0.01. We scale by 100 to work with natural numbers.
+# Threshold A becomes 1 in the scaled domain.
+SCALE_FACTOR = 100 
+A_SCALED = 1 
 
 def fetch():
-    """
-    Fetches 1h ETH/USDT OHLC data from Binance. 
-    Loads from local cache if present.
-    """
     if not os.path.exists(DATA_PATH):
         os.makedirs(DATA_PATH)
     
@@ -27,28 +26,23 @@ def fetch():
     
     if os.path.exists(file_path):
         print(f"Loading data from {file_path}")
-        df = pd.read_csv(file_path)
-        return df
+        return pd.read_csv(file_path)
 
     print("Fetching data from Binance...")
     exchange = ccxt.binance()
-    symbol = 'ETH/USDT'
-    timeframe = '1h'
-    
     all_ohlcv = []
     since = exchange.parse8601('2017-08-17T00:00:00Z') 
     now = exchange.milliseconds()
     
     while since < now:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+            ohlcv = exchange.fetch_ohlcv('ETH/USDT', '1h', since, limit=1000)
             if not ohlcv:
                 break
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1
             print(f"Fetched up to {pd.to_datetime(ohlcv[-1][0], unit='ms')}", end='\r')
-        except Exception as e:
-            print(f"\nError fetching data: {e}")
+        except Exception:
             break
             
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -57,31 +51,27 @@ def fetch():
 
 def prepare(df):
     """
-    Normalizes close price, discretizes by floor(a), and explicitly rounds 
-    to remove floating point artifacts.
+    1. Normalize to first close.
+    2. Multiply by 100 (1/0.01).
+    3. Floor to integer.
     """
     prices = df['close'].values
-    
-    # Normalize
     normalized = prices / prices[0]
     
-    # Calculate required precision based on A (e.g., 0.01 -> 2 decimals)
-    precision = int(abs(math.log10(A)))
+    # Scale and Floor: 1.05 -> 105.0 -> 105
+    # This represents 'rounding to a floor where a is 0.01' but in integer space
+    natural_numbers = np.floor(normalized * SCALE_FACTOR).astype(int)
     
-    # Floor round to nearest A, then strictly round to precision to fix float artifacts
-    # Formula: round(floor(value / step) * step, precision)
-    discretized = np.round(np.floor(normalized / A) * A, precision)
+    # Split
+    split_idx = int(len(natural_numbers) * 0.8)
+    train_data = natural_numbers[:split_idx]
+    test_data = natural_numbers[split_idx:]
     
-    # Split 80/20
-    split_idx = int(len(discretized) * 0.8)
-    train_data = discretized[:split_idx]
-    test_data = discretized[split_idx:]
-    
-    # Plotting
+    # Plotting (Display as float for readability)
     plt.figure(figsize=(12, 6))
-    plt.plot(discretized, label='Normalized & Discretized Price')
+    plt.plot(natural_numbers / SCALE_FACTOR, label='Normalized & Floored Price')
     plt.axvline(x=split_idx, color='r', linestyle='--', label='Train/Test Split')
-    plt.title('ETH 1h Normalized/Discretized Data')
+    plt.title('ETH 1h Data (Step 0.01)')
     plt.legend()
     
     buf = BytesIO()
@@ -94,10 +84,7 @@ def prepare(df):
 def upload(image_buffer, repo_name, file_path):
     load_dotenv()
     token = os.getenv("PAT")
-    
-    if not token:
-        print("Error: PAT not found in .env")
-        return
+    if not token: return
 
     g = Github(token)
     try:
@@ -106,28 +93,21 @@ def upload(image_buffer, repo_name, file_path):
         try:
             contents = repo.get_contents(file_path)
             repo.update_file(contents.path, "Update plot", content, contents.sha)
-            print(f"Plot updated at https://github.com/{repo_name}/{file_path}")
         except:
             repo.create_file(file_path, "Initial plot upload", content)
-            print(f"Plot created at https://github.com/{repo_name}/{file_path}")
     except Exception as e:
-        print(f"Upload failed: {e}")
+        print(f"Upload error: {e}")
 
 def map_sequences(data, input_len=5):
-    """
-    Maps sequences of length 5 to the next value.
-    Ensures keys are standard Python floats to avoid numpy type representation issues.
-    """
     sequences = {}
     
+    # Data is already pure integers, no float artifacts
     for i in range(len(data) - input_len):
-        # Convert numpy types to standard python floats for clean tuples
-        seq = tuple(float(x) for x in data[i:i+input_len])
-        target = float(data[i+input_len])
+        seq = tuple(data[i:i+input_len])
+        target = data[i+input_len]
         
         if seq not in sequences:
             sequences[seq] = {}
-        
         if target not in sequences[seq]:
             sequences[seq][target] = 0
         sequences[seq][target] += 1
@@ -136,17 +116,11 @@ def map_sequences(data, input_len=5):
     for seq, targets in sequences.items():
         total = sum(targets.values())
         model[seq] = {k: v / total for k, v in targets.items()}
-        
     return model
 
 def pred(input_seq, model):
-    # Ensure input is standard tuple of floats
-    clean_input = tuple(float(x) for x in input_seq)
-    
-    if clean_input in model:
-        options = model[clean_input]
-        best_next = max(options, key=options.get)
-        return best_next
+    if input_seq in model:
+        return max(model[input_seq], key=model[input_seq].get)
     return None
 
 def test(test_data, model):
@@ -156,13 +130,14 @@ def test(test_data, model):
     misses = 0
     
     for i in range(len(test_data) - input_len):
-        current_seq = test_data[i:i+input_len]
-        actual_next = float(test_data[i+input_len])
-        current_price = float(current_seq[-1])
+        current_seq = tuple(test_data[i:i+input_len])
+        actual_next = test_data[i+input_len]
+        current_price = current_seq[-1]
         
         predicted_next = pred(current_seq, model)
         
         if predicted_next is not None:
+            # PnL logic in integers
             trade_pnl = 0
             if predicted_next > current_price:
                 trade_pnl = actual_next - current_price 
@@ -171,9 +146,10 @@ def test(test_data, model):
             
             pnl_history.append(trade_pnl)
             
-            if trade_pnl > A:
+            # Use Scaled A (1)
+            if trade_pnl > A_SCALED:
                 hits += 1
-            elif trade_pnl < -A:
+            elif trade_pnl < -A_SCALED:
                 misses += 1
         else:
             pnl_history.append(0)
@@ -181,15 +157,14 @@ def test(test_data, model):
     denominator = hits + misses
     metric = (hits / denominator) if denominator > 0 else 0
     
-    print(f"\n--- Test Results ---")
-    print(f"Trades Evaluated: {len(pnl_history)}")
-    print(f"Wins (> {A}): {hits}")
-    print(f"Losses (< -{A}): {misses}")
-    print(f"Accuracy Metric: {metric:.4f}")
+    print(f"\n--- Test Results (Scaled Units) ---")
+    print(f"Trades: {len(pnl_history)}")
+    print(f"Wins (> {A_SCALED} unit): {hits}")
+    print(f"Losses (< -{A_SCALED} unit): {misses}")
+    print(f"Accuracy: {metric:.4f}")
     
-    cumulative_pnl = np.cumsum(pnl_history)
     plt.figure(figsize=(12, 6))
-    plt.plot(cumulative_pnl, label='Cumulative PnL')
+    plt.plot(np.cumsum(pnl_history), label='Cumulative PnL (Scaled Units)')
     plt.title(f'Strategy PnL (Accuracy: {metric:.2f})')
     plt.legend()
     plt.savefig('test_pnl_plot.png')
@@ -204,16 +179,17 @@ def main():
     model = map_sequences(train)
     
     # Sample Prediction
-    sample_input = train[-5:]
+    sample_input = tuple(train[-5:])
     prediction = pred(sample_input, model)
     
     print("\n--- Sample Prediction ---")
-    # Clean output for display
-    print(f"Input: {[float(x) for x in sample_input]}")
+    print(f"Input (Int): {list(sample_input)}")
     if prediction is not None:
         full_seq = list(sample_input)
         full_seq.append(prediction)
-        print(f"Projected 6-Seq: {[float(x) for x in full_seq]}")
+        print(f"Output (Int): {full_seq}")
+        # Convert back to float for user reference
+        print(f"Output (Float approx): {[x/SCALE_FACTOR for x in full_seq]}")
     else:
         print("Sequence not found.")
 
