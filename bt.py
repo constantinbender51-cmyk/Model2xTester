@@ -1,297 +1,285 @@
+import os
+import math
 import ccxt
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import os
-import requests
-import base64
-import io
 from dotenv import load_dotenv
-from collections import defaultdict, Counter
-import time
+from github import Github
+from io import BytesIO
 
-# Load environment variables
-load_dotenv()
+# Configuration
+DATA_PATH = "/app/data/"
+FILE_NAME = "eth_1h_data.csv"
+REPO_NAME = "constantinbender51-cmyk/Models"
+REMOTE_PLOT_PATH = "plot.png"
+A = 0.01
 
-class ETHModel:
-    def __init__(self):
-        self.df = None
-        self.train_tokens = []
-        self.train_returns = []
-        self.test_tokens = []
-        self.test_returns = []
-        self.sequence_map = defaultdict(Counter)
-        self.best_a = 0.01
-        self.github_owner = "constantinbender51-cmyk"
-        self.github_repo = "Models"
-        self.data_path = "/app/data/eth_ohlc.csv"
+def fetch():
+    """
+    Fetches 1h ETH/USDT OHLC data from Binance. 
+    Loads from local cache if present, otherwise fetches full history.
+    """
+    if not os.path.exists(DATA_PATH):
+        os.makedirs(DATA_PATH)
+    
+    file_path = os.path.join(DATA_PATH, FILE_NAME)
+    
+    if os.path.exists(file_path):
+        print(f"Loading data from {file_path}")
+        df = pd.read_csv(file_path)
+        # Ensure timestamp is correct type if needed, usually csv loads as int/float or string
+        return df
 
-    def fetch(self):
-        """Fetch ohlc eth 1h binance all data, save/load from local path"""
-        if os.path.exists(self.data_path):
-            print(f"Loading data from {self.data_path}...")
-            try:
-                self.df = pd.read_csv(self.data_path)
-                self.df.sort_values('timestamp', inplace=True)
-                print(f"Loaded {len(self.df)} rows from cache.")
-                return
-            except Exception as e:
-                print(f"Error loading cache: {e}. Re-fetching...")
-
-        print("Fetching ETH/USDT 1h data from Binance. This may take a minute...")
-        exchange = ccxt.binance()
-        symbol = 'ETH/USDT'
-        timeframe = '1h'
-        
-        since = exchange.parse8601('2017-08-17T00:00:00Z') 
-        all_ohlcv = []
-        
-        while True:
-            try:
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-                if len(ohlcv) == 0:
-                    break
-                all_ohlcv.extend(ohlcv)
-                since = ohlcv[-1][0] + 60 * 60 * 1000 
-                
-                if since > exchange.milliseconds():
-                    break
-                    
-                time.sleep(exchange.rateLimit / 1000)
-                print(f"Fetched {len(all_ohlcv)} candles...", end='\r')
-            except Exception as e:
-                print(f"\nError fetching data: {e}")
+    print("Fetching data from Binance...")
+    exchange = ccxt.binance()
+    symbol = 'ETH/USDT'
+    timeframe = '1h'
+    
+    # Binance limits fetch per call; pagination required for "all data"
+    # Using a simplified since-based fetch
+    all_ohlcv = []
+    since = exchange.parse8601('2017-08-17T00:00:00Z') # Approximate ETH listing
+    now = exchange.milliseconds()
+    
+    while since < now:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+            if not ohlcv:
                 break
-                
-        self.df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        self.df.sort_values('timestamp', inplace=True)
-        print(f"\nTotal data fetched: {len(self.df)} rows.")
-        
-        try:
-            os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
-            self.df.to_csv(self.data_path, index=False)
-            print(f"Saved data to {self.data_path}")
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
+            print(f"Fetched up to {pd.to_datetime(ohlcv[-1][0], unit='ms')}", end='\r')
         except Exception as e:
-            print(f"Could not save data to {self.data_path}: {e}")
-
-    def prepare(self, a=None):
-        if self.df is None or len(self.df) == 0:
-            print("No data to prepare.")
-            return [], [], [], []
-
-        if a is None:
-            a = self.best_a
+            print(f"\nError fetching data: {e}")
+            break
             
-        prices = self.df['close'].values.astype(float)
-        
-        # 1. Calculate Returns (Stationary Data)
-        # diff / prices[:-1] gives us the % change for each candle
-        actual_returns = np.diff(prices) / (prices[:-1] + 1e-9)
-        
-        # 2. Ternary Discretization (Limit lowest bin to 'a')
-        # 1 = Bullish (> a)
-        # -1 = Bearish (< -a)
-        # 0 = Flat
-        tokens = np.zeros_like(actual_returns)
-        tokens[actual_returns > a] = 1
-        tokens[actual_returns < -a] = -1
-        
-        # Split 50/50
-        split_idx = int(len(tokens) * 0.5)
-        
-        self.train_tokens = tokens[:split_idx]
-        self.train_returns = actual_returns[:split_idx]
-        
-        self.test_tokens = tokens[split_idx:]
-        self.test_returns = actual_returns[split_idx:]
-        
-        return self.train_tokens, self.train_returns, self.test_tokens, self.test_returns
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df.to_csv(file_path, index=False)
+    print(f"\nData saved to {file_path}")
+    return df
 
-    def upload(self, plt_obj, filename):
-        """Save plot to GitHub via API"""
-        token = os.getenv('PAT')
-        if not token:
-            print("Error: PAT not found in .env")
-            return
+def prepare(df):
+    """
+    Normalizes close price to first close, discretizes by floor(a=0.01),
+    splits 80/20, and generates a plot.
+    """
+    # Keep only close
+    prices = df['close'].values
+    
+    # Normalize
+    normalized = prices / prices[0]
+    
+    # Floor round to nearest A (0.01)
+    # Formula: floor(value / step) * step
+    discretized = np.floor(normalized / A) * A
+    
+    # Split 80/20
+    split_idx = int(len(discretized) * 0.8)
+    train_data = discretized[:split_idx]
+    test_data = discretized[split_idx:]
+    
+    # Plotting
+    plt.figure(figsize=(12, 6))
+    plt.plot(discretized, label='Normalized & Discretized Price')
+    plt.axvline(x=split_idx, color='r', linestyle='--', label='Train/Test Split')
+    plt.title('ETH 1h Normalized/Discretized Data')
+    plt.legend()
+    
+    # Save plot to buffer for upload
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close()
+    
+    return train_data, test_data, buf
 
-        buf = io.BytesIO()
-        plt_obj.savefig(buf, format='png', dpi=150)
-        buf.seek(0)
-        content_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        
-        url = f"https://api.github.com/repos/{self.github_owner}/{self.github_repo}/contents/{filename}"
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
+def upload(image_buffer, repo_name, file_path):
+    """
+    Uploads the image buffer to the specified GitHub repository.
+    """
+    load_dotenv()
+    token = os.getenv("PAT")
+    
+    if not token:
+        print("Error: PAT not found in .env")
+        return
+
+    g = Github(token)
+    
+    try:
+        repo = g.get_repo(repo_name)
+        content = image_buffer.getvalue()
         
         try:
-            get_resp = requests.get(url, headers=headers)
-            data = {
-                "message": f"Update {filename}",
-                "content": content_base64
-            }
+            # Check if file exists to update
+            contents = repo.get_contents(file_path)
+            repo.update_file(contents.path, "Update plot", content, contents.sha)
+            print(f"Plot updated at https://github.com/{repo_name}/{file_path}")
+        except:
+            # Create new file if not exists
+            repo.create_file(file_path, "Initial plot upload", content)
+            print(f"Plot created at https://github.com/{repo_name}/{file_path}")
             
-            if get_resp.status_code == 200:
-                data["sha"] = get_resp.json()['sha']
+    except Exception as e:
+        print(f"Upload failed: {e}")
+
+def map_sequences(data, input_len=5):
+    """
+    Maps sequences of length (input_len) to the next value (sequence of 6).
+    Returns a dictionary of probabilities.
+    Structure: { (v1,v2,v3,v4,v5): { next_val1: prob, next_val2: prob } }
+    """
+    sequences = {}
+    
+    # Create windows of 6 (5 input + 1 target)
+    for i in range(len(data) - input_len):
+        seq = tuple(data[i:i+input_len]) # Key must be hashable
+        target = data[i+input_len]
+        
+        if seq not in sequences:
+            sequences[seq] = {}
+        
+        if target not in sequences[seq]:
+            sequences[seq][target] = 0
+        sequences[seq][target] += 1
+        
+    # Convert counts to probabilities
+    model = {}
+    for seq, targets in sequences.items():
+        total = sum(targets.values())
+        model[seq] = {k: v / total for k, v in targets.items()}
+        
+    return model
+
+def pred(input_seq, model):
+    """
+    Takes input tuple of 5. Returns the 6th value with highest probability.
+    Returns None if sequence was not seen in training.
+    """
+    if input_seq in model:
+        # Find key with max value
+        options = model[input_seq]
+        best_next = max(options, key=options.get)
+        return best_next
+    return None
+
+def test(test_data, model):
+    """
+    Tests on test data.
+    Calculates PnL and the specific accuracy metric requested.
+    Saves a result plot locally (since remote upload was done in prepare, 
+    but logic can be reused).
+    """
+    input_len = 5
+    pnl_history = []
+    hits = 0
+    misses = 0
+    ignored = 0 # -a < pnl < a
+    
+    predictions = []
+    actuals = []
+
+    # Iterate through test set
+    for i in range(len(test_data) - input_len):
+        current_seq = tuple(test_data[i:i+input_len])
+        actual_next = test_data[i+input_len]
+        current_price = current_seq[-1]
+        
+        predicted_next = pred(current_seq, model)
+        
+        if predicted_next is not None:
+            # Logic: If model predicts, we take that trade? 
+            # Or is PnL based on the accuracy of the prediction?
+            # Standard PnL: (Exit - Entry) / Entry. 
+            # Here: We assume we bought at current_price and sold at actual_next.
+            # But the metric implies we only care if PnL > A. 
             
-            print(f"Uploading to {filename}...")
-            resp = requests.put(url, json=data, headers=headers)
-            if resp.status_code in [200, 201]:
-                print(f"Successfully uploaded {filename}.")
+            # Let's define PnL as the difference between Actual Next and Current 
+            # IF the model predicted the correct direction.
+            # However, simpler interpretation: PnL of the *predicted move* vs reality.
+            
+            # Implementation:
+            # We assume a Long strategy if Predicted > Current.
+            # We assume a Short strategy if Predicted < Current.
+            # If Predicted == Current, no trade.
+            
+            trade_pnl = 0
+            if predicted_next > current_price:
+                # Long
+                trade_pnl = actual_next - current_price 
+            elif predicted_next < current_price:
+                # Short
+                trade_pnl = current_price - actual_next
+            
+            pnl_history.append(trade_pnl)
+            
+            # Metric Calculation
+            if trade_pnl > A:
+                hits += 1
+            elif trade_pnl < -A:
+                misses += 1
             else:
-                print(f"Failed to upload {filename}: {resp.status_code} {resp.text}")
-        except Exception as e:
-            print(f"Connection error during upload: {e}")
-
-    def map_sequences(self, tokens):
-        """Build map from discrete tokens (-1, 0, 1)"""
-        self.sequence_map.clear()
-        if len(tokens) < 6: return
-
-        for i in range(len(tokens) - 5):
-            seq = tuple(tokens[i : i+5])
-            next_val = tokens[i+5]
-            self.sequence_map[seq][next_val] += 1
-            
-    def pred(self, input_seq):
-        """Predict next token (-1, 0, 1) based on sequence"""
-        seq_key = tuple(input_seq)
-        if seq_key in self.sequence_map and self.sequence_map[seq_key]:
-            prediction = self.sequence_map[seq_key].most_common(1)[0][0]
-            return prediction
+                ignored += 1
+                
+            predictions.append(predicted_next)
         else:
-            return 0 # Default to Flat/No Trade if unknown
+            predictions.append(np.nan) # Unknown state
+            pnl_history.append(0)
+        
+        actuals.append(actual_next)
 
-    def grid(self):
-        print("\nStarting Grid Search for 'a' (Floor 1%)...")
-        # Lowest bin limited to 1% (0.01)
-        a_values = [0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
-        best_score = -float('inf')
-        
-        for a in a_values:
-            t_tokens, t_returns, _, _ = self.prepare(a)
-            self.map_sequences(t_tokens)
-            
-            # Score metrics
-            wins = 0
-            losses = 0
-            
-            if len(t_tokens) < 6: continue
-            
-            for i in range(len(t_tokens) - 5):
-                current_seq = t_tokens[i : i+5]
-                # Note: We don't predict price, we predict direction (-1, 0, 1)
-                predicted_token = self.pred(current_seq)
-                
-                # Check outcome against REAL return
-                actual_ret = t_returns[i+5]
-                
-                # Logic: 
-                # If we predict 1 (Up), we profit if actual_ret > 0
-                # If we predict -1 (Down), we profit if actual_ret < 0
-                
-                trade_pnl = actual_ret * predicted_token
-                
-                # We only count "Wins" if the move was substantial enough to cover fees/slippage
-                # Using 'a' as a proxy for significant win
-                if trade_pnl > 0: 
-                    wins += 1
-                elif trade_pnl < 0:
-                    losses += 1
-            
-            score = wins - losses
-            print(f"a={a:.3f}: Score={score} (Wins {wins} / Losses {losses})")
-            
-            if score > best_score:
-                best_score = score
-                self.best_a = a
-        
-        print(f"Optimization complete. Best a: {self.best_a}")
+    # Calculate Metric
+    # times pnl > a / (times pnl > a + times pnl < -a)
+    denominator = hits + misses
+    metric = (hits / denominator) if denominator > 0 else 0
+    
+    print(f"\n--- Test Results ---")
+    print(f"Total Trades Simulated: {len(pnl_history)}")
+    print(f"PnL > {A}: {hits}")
+    print(f"PnL < -{A}: {misses}")
+    print(f"Metric (Wins / Wins+Losses): {metric:.4f}")
+    
+    # Plot PnL curve
+    cumulative_pnl = np.cumsum(pnl_history)
+    plt.figure(figsize=(12, 6))
+    plt.plot(cumulative_pnl, label='Cumulative PnL (Test)')
+    plt.title(f'Strategy PnL (Metric: {metric:.2f})')
+    plt.legend()
+    plt.savefig('test_pnl_plot.png')
+    print("Test PnL plot saved to test_pnl_plot.png")
 
-    def test(self):
-        print(f"\nRunning Test with best a={self.best_a}...")
-        t_tokens, t_returns, test_tokens, test_returns = self.prepare(self.best_a)
-        
-        # Train on TRAIN data
-        self.map_sequences(t_tokens)
-        
-        if len(test_tokens) < 6:
-            print("Not enough test data.")
-            return
+def main():
+    # 1. Fetch
+    df = fetch()
+    
+    # 2. Prepare
+    train, test_data, plot_buf = prepare(df)
+    
+    # 3. Upload Plot
+    upload(plot_buf, REPO_NAME, REMOTE_PLOT_PATH)
+    
+    # 4. Map Sequences
+    print("Mapping sequences (Training)...")
+    model = map_sequences(train)
+    
+    # 5. Example Prediction
+    # Take last 5 from training to predict next
+    sample_input = tuple(train[-5:])
+    prediction = pred(sample_input, model)
+    
+    print("\n--- Sample Prediction ---")
+    print(f"Input Sequence: {sample_input}")
+    if prediction is not None:
+        # Output 6 starting with 5 with highest probability
+        full_sequence = list(sample_input)
+        full_sequence.append(prediction)
+        print(f"Highest Prob 6-Seq: {full_sequence}")
+    else:
+        print("Sequence not found in training map.")
 
-        cumulative_pnl = [0]
-        wins = 0
-        losses = 0
-        total_predictions = 0
-        flat_predictions = 0
-        
-        for i in range(len(test_tokens) - 5):
-            current_seq = test_tokens[i : i+5]
-            predicted_token = self.pred(current_seq)
-            total_predictions += 1
-            
-            if predicted_token == 0:
-                flat_predictions += 1
-                # Append previous PnL to keep graph continuity
-                cumulative_pnl.append(cumulative_pnl[-1])
-                continue
-
-            actual_ret = test_returns[i+5]
-            
-            # PnL = Direction * Return
-            # If pred=1 and ret=0.02 -> profit 0.02
-            # If pred=-1 and ret=-0.02 -> profit 0.02
-            trade_pnl = predicted_token * actual_ret
-            
-            cumulative_pnl.append(cumulative_pnl[-1] + trade_pnl)
-            
-            if trade_pnl > 0:
-                wins += 1
-            elif trade_pnl < 0:
-                losses += 1
-        
-        denominator = wins + losses
-        accuracy = 0
-        if denominator > 0:
-            accuracy = wins / denominator
-            
-        print(f"Results on Test Data: Accuracy={accuracy:.2%}, Wins={wins}, Losses={losses}")
-        print(f"Total Predictions: {total_predictions}")
-        print(f"Flat Predictions (No Trade): {flat_predictions}")
-        print(f"Final Cumulative Return: {cumulative_pnl[-1]:.4f} ({(cumulative_pnl[-1]*100):.2f}%)")
-        
-        plt.figure(figsize=(12, 6))
-        plt.plot(cumulative_pnl, label='Cumulative Returns', color='blue')
-        plt.title(f'Strategy Returns (a={self.best_a}) | Acc: {accuracy:.2%}')
-        plt.xlabel('Hours (Test Set)')
-        plt.ylabel('Return (1.0 = 100%)')
-        plt.legend()
-        plt.grid(True)
-        
-        self.upload(plt, "plot/pnl.png")
-        plt.close()
-
-    def main(self):
-        self.fetch()
-        if self.df is None or len(self.df) == 0: return
-
-        print("\nGenerating plot of all data...")
-        # Just plot the raw close prices for context
-        plt.figure(figsize=(15, 7))
-        plt.plot(self.df['close'].values, label='ETH Price', linewidth=0.5)
-        plt.axvline(x=len(self.df)//2, color='r', linestyle='--', label='Train/Test Split')
-        plt.title(f"All ETH/USDT 1h Data")
-        plt.legend()
-        plt.grid(True)
-        
-        self.upload(plt, "plot/plot.png")
-        plt.close()
-        
-        self.grid()
-        self.test()
-        print("\nExit.")
+    # 6. Test
+    test(test_data, model)
 
 if __name__ == "__main__":
-    model = ETHModel()
-    model.main()
+    main()
