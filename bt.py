@@ -16,10 +16,11 @@ load_dotenv()
 class ETHModel:
     def __init__(self):
         self.df = None
-        self.train_data = []
-        self.test_data = []
+        self.train_data = [] # Will store pct changes
+        self.test_data = []  # Will store pct changes
+        self.raw_prices = [] # Store raw prices to calculate PnL later
         self.sequence_map = defaultdict(Counter)
-        self.best_a = 0.01
+        self.best_a = 0.001 # Default step for percentage (0.1%)
         self.github_owner = "constantinbender51-cmyk"
         self.github_repo = "Models"
         self.data_path = "/app/data/eth_ohlc.csv"
@@ -73,6 +74,9 @@ class ETHModel:
             print(f"Could not save data to {self.data_path}: {e}")
 
     def prepare(self, a=None):
+        """
+        Convert prices to Percentage Changes -> Round to 'a' floor -> Split
+        """
         if self.df is None or len(self.df) == 0:
             print("No data to prepare.")
             return [], []
@@ -81,15 +85,26 @@ class ETHModel:
             a = self.best_a
             
         prices = self.df['close'].values.astype(float)
-        start_price = prices[0] if prices[0] != 0 else 1
-        normalized = prices / start_price
+        self.raw_prices = prices # Save for PnL calculation
         
-        discretized = np.floor((normalized + 1e-9) / a) * a
+        # Calculate Percentage Change: (Price_t - Price_t-1) / Price_t-1
+        # Insert 0 at the start to keep length consistent with prices
+        pct_changes = np.diff(prices, prepend=prices[0]) / prices
+        # Fix the first element (prepend) being 0
+        pct_changes[0] = 0 
+        
+        # Round to floor where a is step (e.g. 0.001 = 0.1%)
+        # Adding epsilon to handle floating point noise
+        discretized_pct = np.floor((pct_changes + 1e-9) / a) * a
         
         # Split 50/50
-        split_idx = int(len(discretized) * 0.5)
-        self.train_data = discretized[:split_idx]
-        self.test_data = discretized[split_idx:]
+        split_idx = int(len(discretized_pct) * 0.5)
+        self.train_data = discretized_pct[:split_idx]
+        self.test_data = discretized_pct[split_idx:]
+        
+        # Also split raw prices for testing accuracy later
+        self.train_prices = prices[:split_idx]
+        self.test_prices = prices[split_idx:]
         
         return self.train_data, self.test_data
 
@@ -131,58 +146,76 @@ class ETHModel:
             print(f"Connection error during upload: {e}")
 
     def map_sequences(self, data):
+        """Map sequences of 5 percentage changes to the 6th"""
         self.sequence_map.clear()
         if len(data) < 6: return
 
+        # Sequence: [pct_1, pct_2, pct_3, pct_4, pct_5] -> predicts pct_6
         for i in range(len(data) - 5):
             seq = tuple(data[i : i+5])
             next_val = data[i+5]
             self.sequence_map[seq][next_val] += 1
             
     def pred(self, input_seq):
+        """Returns the most probable next PERCENTAGE move"""
         seq_key = tuple(input_seq)
         if seq_key in self.sequence_map and self.sequence_map[seq_key]:
             prediction = self.sequence_map[seq_key].most_common(1)[0][0]
             return prediction
         else:
-            return input_seq[-1]
+            # Fallback: Assume 0% change (flat) if unknown sequence
+            return 0.0
 
     def grid(self):
-        print("\nStarting Grid Search for 'a'...")
-        a_values = [0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
+        """
+        Optimize 'a' (percentage bucket size).
+        Range: 0.0005 (0.05%) to 0.005 (0.5%)
+        """
+        print("\nStarting Grid Search for 'a' (Percentage Change buckets)...")
+        a_values = [0.0005, 0.001, 0.002, 0.003, 0.004, 0.005]
         best_score = -float('inf')
         
         for a in a_values:
-            train_qs, _ = self.prepare(a)
-            self.map_sequences(train_qs)
+            train_pcts, _ = self.prepare(a)
+            self.map_sequences(train_pcts)
             
             pnl_greater_a = 0
             pnl_less_neg_a = 0
             
-            if len(train_qs) < 6: continue
+            if len(train_pcts) < 6: continue
             
-            for i in range(len(train_qs) - 5):
-                current_seq = train_qs[i : i+5]
-                current_price = train_qs[i+4]
-                actual_next = train_qs[i+5]
+            # Use raw prices for accurate PnL calculation
+            prices_subset = self.train_prices
+            
+            for i in range(len(train_pcts) - 5):
+                current_seq = train_pcts[i : i+5]
+                current_price = prices_subset[i+4]
+                actual_next_price = prices_subset[i+5]
                 
-                predicted_next = self.pred(current_seq)
+                # Predict the next % move
+                pred_pct = self.pred(current_seq)
                 
+                # Direction is based on the SIGN of the predicted % change
                 direction = 0
-                if predicted_next > current_price + 1e-9:
+                if pred_pct > 0:
                     direction = 1
-                elif predicted_next < current_price - 1e-9:
+                elif pred_pct < 0:
                     direction = -1
                 
-                trade_pnl = (actual_next - current_price) * direction
+                # PnL = (Actual Price Move) * Direction
+                trade_pnl = (actual_next_price - current_price) * direction
                 
-                if trade_pnl > a:
+                # We normalize PnL by price to keep score consistent across years
+                # Normalized PnL = trade_pnl / current_price
+                norm_pnl = trade_pnl / current_price
+                
+                if norm_pnl > a:
                     pnl_greater_a += 1
-                elif trade_pnl < -a:
+                elif norm_pnl < -a:
                     pnl_less_neg_a += 1
             
             score = pnl_greater_a - pnl_less_neg_a
-            print(f"a={a:.3f}: Score={score} (+{pnl_greater_a} / -{pnl_less_neg_a})")
+            print(f"a={a:.4f}: Score={score} (+{pnl_greater_a} / -{pnl_less_neg_a})")
             
             if score > best_score:
                 best_score = score
@@ -192,10 +225,12 @@ class ETHModel:
 
     def test(self):
         print(f"\nRunning Test with best a={self.best_a}...")
-        train_final, test_final = self.prepare(self.best_a)
-        self.map_sequences(train_final)
+        train_pcts, test_pcts = self.prepare(self.best_a)
         
-        if len(test_final) < 6:
+        # Map using training data
+        self.map_sequences(train_pcts)
+        
+        if len(test_pcts) < 6:
             print("Not enough test data.")
             return
 
@@ -207,29 +242,42 @@ class ETHModel:
         total_predictions = 0
         flat_predictions = 0
         
-        for i in range(len(test_final) - 5):
-            current_seq = test_final[i : i+5]
-            current_price = test_final[i+4]
-            actual_next = test_final[i+5]
+        prices_subset = self.test_prices
+        
+        # Loop through TEST data
+        for i in range(len(test_pcts) - 5):
+            current_seq = test_pcts[i : i+5]
             
-            predicted_next = self.pred(current_seq)
+            # Get actual prices for PnL (Offset by 5 because sequences consume 5 steps)
+            # index i in test_pcts corresponds to predicting move at i+5
+            current_price = prices_subset[i+4]
+            actual_next_price = prices_subset[i+5]
+            
+            # Prediction is a PERCENTAGE move
+            pred_pct = self.pred(current_seq)
             total_predictions += 1
             
             direction = 0
-            if predicted_next > current_price + 1e-9:
+            if pred_pct > 0:
                 direction = 1
-            elif predicted_next < current_price - 1e-9:
+            elif pred_pct < 0:
                 direction = -1
             else:
                 flat_predictions += 1
                 
-            trade_pnl = (actual_next - current_price) * direction
-            pnls.append(trade_pnl)
-            cumulative_pnl.append(cumulative_pnl[-1] + trade_pnl)
+            # Trade PnL ($)
+            trade_pnl_usd = (actual_next_price - current_price) * direction
             
-            if trade_pnl > self.best_a:
+            # Normalize PnL to units of 'a' for the chart (so 2017 and 2022 are comparable)
+            # This shows "Percent Return" accumulation
+            pct_return = trade_pnl_usd / current_price
+            
+            pnls.append(pct_return)
+            cumulative_pnl.append(cumulative_pnl[-1] + pct_return)
+            
+            if pct_return > self.best_a:
                 count_pnl_gt_a += 1
-            elif trade_pnl < -self.best_a:
+            elif pct_return < -self.best_a:
                 count_pnl_lt_neg_a += 1
         
         denominator = count_pnl_gt_a + count_pnl_lt_neg_a
@@ -242,10 +290,10 @@ class ETHModel:
         print(f"Flat Predictions (No Trade): {flat_predictions}")
         
         plt.figure(figsize=(12, 6))
-        plt.plot(cumulative_pnl, label='Cumulative PnL', color='green')
-        plt.title(f'Strategy PnL (a={self.best_a}) | Acc: {accuracy:.2%}')
+        plt.plot(cumulative_pnl, label='Cumulative Return %', color='green')
+        plt.title(f'Strategy PnL (Relative % Mode, a={self.best_a}) | Acc: {accuracy:.2%}')
         plt.xlabel('Trades')
-        plt.ylabel('PnL')
+        plt.ylabel('Cumulative Return (1.0 = 100%)')
         plt.legend()
         plt.grid(True)
         
@@ -257,16 +305,20 @@ class ETHModel:
         if self.df is None or len(self.df) == 0: return
 
         print("\nGenerating plot of all data...")
-        viz_a = 0.01 
+        # Visualizing Percentage Volatility instead of normalized price
+        viz_a = 0.005
         train_viz, test_viz = self.prepare(viz_a)
         all_data = np.concatenate((train_viz, test_viz))
         split_index = len(train_viz)
         
         plt.figure(figsize=(15, 7))
-        plt.plot(all_data, label=f'Normalized Price (a={viz_a})', linewidth=0.5)
+        # Plotting a subset of volatility to avoid clutter, or a rolling average
+        # Let's plot the "discretized percent change" to show what the model sees
+        plt.plot(all_data, label=f'Discretized % Change (a={viz_a})', linewidth=0.1, alpha=0.7)
         plt.axvline(x=split_index, color='r', linestyle='--', linewidth=1.5, label='Split (50/50)')
-        plt.title(f"All ETH/USDT 1h Data (N={len(all_data)})")
+        plt.title(f"Market 'Heartbeat': % Change Sequences (N={len(all_data)})")
         plt.legend()
+        plt.ylim(-0.05, 0.05) # Limit view to +/- 5% candles for clarity
         plt.grid(True)
         
         self.upload(plt, "plot/plot.png")
