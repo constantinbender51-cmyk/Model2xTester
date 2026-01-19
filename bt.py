@@ -4,7 +4,6 @@ import pickle
 import time
 import json
 import random
-import threading
 import http.server
 import socketserver
 import numpy as np
@@ -69,7 +68,7 @@ def fetch_history(symbol, since_ts):
     exchange = ccxt.binance()
     all_ohlcv = []
     
-    print(f"[*] Fetching data for {symbol} since {datetime.fromtimestamp(since_ts/1000)}...")
+    print(f"[*] Fetching data for {symbol} since {datetime.fromtimestamp(since_ts/1000, tz=timezone.utc)}...")
     
     while True:
         try:
@@ -121,8 +120,8 @@ def run_backtest():
     anchor_price = model_data['initial_price']
     configs = model_data['ensemble_configs']
 
-    # 3. Fetch Data (From Jan 1, 2025)
-    start_date = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    # 3. Fetch Data (From Jan 1, 2024) - MODIFIED HERE
+    start_date = datetime(2024, 1, 1, tzinfo=timezone.utc)
     since_ts = int(start_date.timestamp() * 1000)
     df = fetch_history(selected_asset, since_ts)
 
@@ -138,9 +137,7 @@ def run_backtest():
     equity_curve = []
     trades = []
     
-    # We need a rolling window. The max sequence length in configs determines the warmup.
-    # To be safe, we look at the longest seq_len in configs, usually < 20.
-    # Let's use 50 as a safe warmup buffer.
+    # Warmup buffer
     warmup = 50 
     closes = df['close'].values
     timestamps = df['datetime'].values
@@ -183,7 +180,7 @@ def run_backtest():
     # -- Plotting --
     plt.figure(figsize=(10, 6))
     plt.plot(eq_df['date'], eq_df['equity'], label='Equity ($)', color='blue')
-    plt.title(f"Backtest Equity Curve: {selected_asset} (2025-Now)")
+    plt.title(f"Backtest Equity Curve: {selected_asset} (2024-Now)") # Updated Title
     plt.xlabel("Date")
     plt.ylabel("Equity ($)")
     plt.grid(True, alpha=0.3)
@@ -244,7 +241,7 @@ def generate_html(asset, stats, start_eq, end_eq):
     <body>
         <h1>Backtest Report: {asset}</h1>
         <div class="summary">
-            <p><strong>Period:</strong> 2025-01-01 to Present</p>
+            <p><strong>Period:</strong> 2024-01-01 to Present</p>
             <p><strong>Initial Equity:</strong> ${start_eq:.2f}</p>
             <p><strong>Final Equity:</strong> ${end_eq:.2f}</p>
             <p><strong>Total Return:</strong> {total_ret:.2f}%</p>
