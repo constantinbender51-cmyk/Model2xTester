@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 # 1. Load Environment Variables
 load_dotenv()
-GITHUB_PAT = os.getenv("GITHUB_PAT")  # Ensure your .env key is named GITHUB_PAT or update this
+GITHUB_PAT = os.getenv("PAT")  # Ensure your .env key is named GITHUB_PAT or update this
 
 if not GITHUB_PAT:
     raise ValueError("Error: GITHUB_PAT not found in .env file.")
