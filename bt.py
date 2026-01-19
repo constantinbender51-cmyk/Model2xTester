@@ -86,7 +86,8 @@ class ETHModel:
         
         discretized = np.floor((normalized + 1e-9) / a) * a
         
-        split_idx = int(len(discretized) * 0.8)
+        # Split 50/50
+        split_idx = int(len(discretized) * 0.5)
         self.train_data = discretized[:split_idx]
         self.test_data = discretized[split_idx:]
         
@@ -203,7 +204,6 @@ class ETHModel:
         count_pnl_lt_neg_a = 0
         cumulative_pnl = [0]
         
-        # New counters
         total_predictions = 0
         flat_predictions = 0
         
@@ -264,7 +264,7 @@ class ETHModel:
         
         plt.figure(figsize=(15, 7))
         plt.plot(all_data, label=f'Normalized Price (a={viz_a})', linewidth=0.5)
-        plt.axvline(x=split_index, color='r', linestyle='--', linewidth=1.5, label='Split')
+        plt.axvline(x=split_index, color='r', linestyle='--', linewidth=1.5, label='Split (50/50)')
         plt.title(f"All ETH/USDT 1h Data (N={len(all_data)})")
         plt.legend()
         plt.grid(True)
