@@ -11,7 +11,6 @@ from collections import defaultdict, Counter
 import time
 
 # Load environment variables
-# Ensure your .env file has PAT=ghp_your_token
 load_dotenv()
 
 class ETHModel:
@@ -21,19 +20,31 @@ class ETHModel:
         self.test_data = []
         self.sequence_map = defaultdict(Counter)
         self.best_a = 0.01
-        # Update these to match your GitHub username and repo name exactly
         self.github_owner = "constantinbender51-cmyk"
         self.github_repo = "Models"
+        # path for local caching
+        self.data_path = "/app/data/eth_ohlc.csv"
 
     def fetch(self):
-        """Fetch ohlc eth 1h binance all data"""
+        """Fetch ohlc eth 1h binance all data, save/load from local path"""
+        
+        # 1. Try to load from local file first
+        if os.path.exists(self.data_path):
+            print(f"Loading data from {self.data_path}...")
+            try:
+                self.df = pd.read_csv(self.data_path)
+                self.df.sort_values('timestamp', inplace=True)
+                print(f"Loaded {len(self.df)} rows from cache.")
+                return
+            except Exception as e:
+                print(f"Error loading cache: {e}. Re-fetching...")
+
+        # 2. Fetch from Binance if no cache or error
         print("Fetching ETH/USDT 1h data from Binance. This may take a minute...")
         exchange = ccxt.binance()
         symbol = 'ETH/USDT'
         timeframe = '1h'
         
-        # Binance limits to 1000 candles per call.
-        # We start from approx ETH listing (Aug 2017) and paginate forward.
         since = exchange.parse8601('2017-08-17T00:00:00Z') 
         all_ohlcv = []
         
@@ -43,14 +54,11 @@ class ETHModel:
                 if len(ohlcv) == 0:
                     break
                 all_ohlcv.extend(ohlcv)
-                # Update 'since' to the last timestamp + 1h in ms to get next batch
                 since = ohlcv[-1][0] + 60 * 60 * 1000 
                 
-                # Check if we reached current time roughly
                 if since > exchange.milliseconds():
                     break
                     
-                # Rate limit safety
                 time.sleep(exchange.rateLimit / 1000)
                 print(f"Fetched {len(all_ohlcv)} candles...", end='\r')
             except Exception as e:
@@ -58,14 +66,19 @@ class ETHModel:
                 break
                 
         self.df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # Ensure data is sorted by time just in case
         self.df.sort_values('timestamp', inplace=True)
         print(f"\nTotal data fetched: {len(self.df)} rows.")
+        
+        # 3. Save to local path
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
+            self.df.to_csv(self.data_path, index=False)
+            print(f"Saved data to {self.data_path}")
+        except Exception as e:
+            print(f"Could not save data to {self.data_path}: {e}")
 
     def prepare(self, a=None):
-        """
-        Keep close, Normalize to first close, Round to floor where a is step, Split 80/20
-        """
         if self.df is None or len(self.df) == 0:
             print("No data to prepare.")
             return [], []
@@ -73,16 +86,11 @@ class ETHModel:
         if a is None:
             a = self.best_a
             
-        # Keep close
         prices = self.df['close'].values.astype(float)
-        
-        # Normalize to first close (avoid division by zero if first close is 0, though unlikely for ETH)
         start_price = prices[0] if prices[0] != 0 else 1
         normalized = prices / start_price
         
         # Round to floor where a is step
-        # formula: floor(x / a) * a
-        # Adding a small epsilon to handle floating point inaccuracies before flooring
         discretized = np.floor((normalized + 1e-9) / a) * a
         
         # Split 80/20
@@ -92,8 +100,8 @@ class ETHModel:
         
         return self.train_data, self.test_data
 
-    def upload(self, plt_obj, filename="plot.png"):
-        """Save plot to GitHub via API"""
+    def upload(self, plt_obj, filename):
+        """Save plot to GitHub via API (supports folder paths like 'plot/plot.png')"""
         token = os.getenv('PAT')
         if not token:
             print("Error: PAT not found in .env")
@@ -101,7 +109,7 @@ class ETHModel:
 
         # Save plot to buffer
         buf = io.BytesIO()
-        plt_obj.savefig(buf, format='png', dpi=150) # Increased DPI for denser plots
+        plt_obj.savefig(buf, format='png', dpi=150)
         buf.seek(0)
         content_base64 = base64.b64encode(buf.read()).decode('utf-8')
         
@@ -111,18 +119,18 @@ class ETHModel:
             "Accept": "application/vnd.github.v3+json"
         }
         
-        # Check if file exists to get SHA (needed for update)
+        # Check if file exists to get SHA
         try:
             get_resp = requests.get(url, headers=headers)
             data = {
-                "message": f"Update plot generated by script",
+                "message": f"Update {filename}",
                 "content": content_base64
             }
             
             if get_resp.status_code == 200:
                 data["sha"] = get_resp.json()['sha']
             
-            print(f"Uploading {filename} to GitHub...")
+            print(f"Uploading to {filename}...")
             resp = requests.put(url, json=data, headers=headers)
             if resp.status_code in [200, 201]:
                 print(f"Successfully uploaded {filename}.")
@@ -132,45 +140,27 @@ class ETHModel:
             print(f"Connection error during upload: {e}")
 
     def map_sequences(self, data):
-        """Map all sequences of 5 to probabilities of the 6th element"""
         self.sequence_map.clear()
-        
-        if len(data) < 6:
-            return
+        if len(data) < 6: return
 
-        # Sliding window of size 6
-        # Sequence: [t-5, t-4, t-3, t-2, t-1] -> Predicts [t]
         for i in range(len(data) - 5):
-            # Input sequence (length 5)
             seq = tuple(data[i : i+5])
-            # Actual next value (length 1)
             next_val = data[i+5]
             self.sequence_map[seq][next_val] += 1
             
     def pred(self, input_seq):
-        """
-        Take input 5. Output 6 starting with 5 with highest probability.
-        Returns: The predicted 6th value.
-        """
         seq_key = tuple(input_seq)
         if seq_key in self.sequence_map and self.sequence_map[seq_key]:
-            # Get the value with highest count
             prediction = self.sequence_map[seq_key].most_common(1)[0][0]
             return prediction
         else:
-            # Fallback if sequence unseen: assume no change (neutral)
             return input_seq[-1]
 
     def grid(self):
-        """
-        Grid search 'a' to optimize score: (times pnl > a) - (times pnl < -a)
-        """
         print("\nStarting Grid Search for 'a'...")
-        # Define search range for 'a'
         a_values = [0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
         best_score = -float('inf')
         
-        # We only use training data for grid search optimization
         for a in a_values:
             train_qs, _ = self.prepare(a)
             self.map_sequences(train_qs)
@@ -178,24 +168,21 @@ class ETHModel:
             pnl_greater_a = 0
             pnl_less_neg_a = 0
             
-            # Evaluate on training set
             if len(train_qs) < 6: continue
             
             for i in range(len(train_qs) - 5):
                 current_seq = train_qs[i : i+5]
-                current_price = train_qs[i+4] # The last known price in the sequence
+                current_price = train_qs[i+4]
                 actual_next = train_qs[i+5]
                 
                 predicted_next = self.pred(current_seq)
                 
-                # Determine direction based on prediction vs current price
                 direction = 0
                 if predicted_next > current_price + 1e-9:
-                    direction = 1 # Buy
+                    direction = 1
                 elif predicted_next < current_price - 1e-9:
-                    direction = -1 # Sell
+                    direction = -1
                 
-                # Calculate PnL: (Change in price) * Direction based on prediction
                 trade_pnl = (actual_next - current_price) * direction
                 
                 if trade_pnl > a:
@@ -213,14 +200,8 @@ class ETHModel:
         print(f"Optimization complete. Best a: {self.best_a}")
 
     def test(self):
-        """
-        Test on test data. Plot pnl. Calculate accuracy.
-        """
         print(f"\nRunning Test with best a={self.best_a}...")
-        # 1. Prepare train/test data with optimal 'a'
         train_final, test_final = self.prepare(self.best_a)
-        
-        # 2. Map sequences using ONLY training data
         self.map_sequences(train_final)
         
         if len(test_final) < 6:
@@ -232,7 +213,6 @@ class ETHModel:
         count_pnl_lt_neg_a = 0
         cumulative_pnl = [0]
         
-        # 3. Run prediction loop over test data
         for i in range(len(test_final) - 5):
             current_seq = test_final[i : i+5]
             current_price = test_final[i+4]
@@ -241,7 +221,6 @@ class ETHModel:
             predicted_next = self.pred(current_seq)
             
             direction = 0
-            # Using tolerance for floating point comparison
             if predicted_next > current_price + 1e-9:
                 direction = 1
             elif predicted_next < current_price - 1e-9:
@@ -251,81 +230,56 @@ class ETHModel:
             pnls.append(trade_pnl)
             cumulative_pnl.append(cumulative_pnl[-1] + trade_pnl)
             
-            # Metrics calculation based on 'a' threshold
             if trade_pnl > self.best_a:
                 count_pnl_gt_a += 1
             elif trade_pnl < -self.best_a:
                 count_pnl_lt_neg_a += 1
         
-        # Accuracy Metric: times pnl > a / (times pnl > a + times pnl < -a)
         denominator = count_pnl_gt_a + count_pnl_lt_neg_a
         accuracy = 0
         if denominator > 0:
             accuracy = count_pnl_gt_a / denominator
             
-        print(f"Results on Test Data (approx {len(test_final)} hours):")
-        print(f"Significant Wins (> {self.best_a}): {count_pnl_gt_a}")
-        print(f"Significant Losses (< -{self.best_a}): {count_pnl_lt_neg_a}")
-        print(f"Accuracy of Significant Moves: {accuracy:.2%}")
+        print(f"Results on Test Data: Accuracy={accuracy:.2%}, Wins={count_pnl_gt_a}, Losses={count_pnl_lt_neg_a}")
         
-        # Plot PnL
         plt.figure(figsize=(12, 6))
         plt.plot(cumulative_pnl, label='Cumulative PnL', color='green')
-        plt.title(f'Strategy PnL (a={self.best_a}) | Signif. Acc: {accuracy:.2%}')
-        plt.xlabel('Test period trades (hourly)')
-        plt.ylabel('Cumulative PnL (Normalized Units)')
+        plt.title(f'Strategy PnL (a={self.best_a}) | Acc: {accuracy:.2%}')
+        plt.xlabel('Trades')
+        plt.ylabel('PnL')
         plt.legend()
         plt.grid(True)
-        plt.tight_layout()
         
-        # Save and Upload PnL plot
-        self.upload(plt, "pnl_plot.png")
+        # Save PnL plot to plot/pnl.png
+        self.upload(plt, "plot/pnl.png")
         plt.close()
 
     def main(self):
-        # 1. Fetch
         self.fetch()
-        
-        if self.df is None or len(self.df) == 0:
-             print("Exiting due to no data.")
-             return
+        if self.df is None or len(self.df) == 0: return
 
-        # 2. Plot ALL Data (as requested)
+        # Plot ALL Data
         print("\nGenerating plot of all data...")
-        # We prepare with a default 'a' just for visualization purposes
         viz_a = 0.01 
         train_viz, test_viz = self.prepare(viz_a)
-        
-        # Concatenate back together to show the whole timeline
-        all_prepared_data = np.concatenate((train_viz, test_viz))
+        all_data = np.concatenate((train_viz, test_viz))
         split_index = len(train_viz)
         
-        plt.figure(figsize=(15, 7)) # Larger size for all data
-        # Using a thinner line (linewidth=0.5) because ~74k points are dense
-        plt.plot(all_prepared_data, label=f'Normalized Price (floored a={viz_a})', linewidth=0.5)
-        
-        # Add a vertical line marking the 80/20 split
-        plt.axvline(x=split_index, color='r', linestyle='--', linewidth=1.5, label='Train/Test Split (80/20)')
-        
-        plt.title(f"All ETH/USDT 1h Data (Normalized & Floored, N={len(all_prepared_data)})")
-        plt.xlabel("Hours since start")
-        plt.ylabel("Normalized Price")
+        plt.figure(figsize=(15, 7))
+        plt.plot(all_data, label=f'Normalized Price (a={viz_a})', linewidth=0.5)
+        plt.axvline(x=split_index, color='r', linestyle='--', linewidth=1.5, label='Split')
+        plt.title(f"All ETH/USDT 1h Data (N={len(all_data)})")
         plt.legend()
-        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-        plt.tight_layout()
+        plt.grid(True)
         
-        self.upload(plt, "data_plot.png")
+        # Save data plot to plot/plot.png
+        self.upload(plt, "plot/plot.png")
         plt.close()
         
-        # 3. Grid Search (optimizes self.best_a on training data)
         self.grid()
-        
-        # 4. Test (evaluates on test data and plots PnL)
         self.test()
-        
         print("\nExit.")
 
 if __name__ == "__main__":
-    # Ensure repository parameters are correct in __init__ before running
     model = ETHModel()
     model.main()
