@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 # 1. Load Environment Variables
 load_dotenv()
-GITHUB_PAT = os.getenv("GITHUB_PAT")
+GITHUB_PAT = os.getenv("PAT")
 
 # 2. Configuration
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
