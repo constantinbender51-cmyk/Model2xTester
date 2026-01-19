@@ -12,7 +12,7 @@ from io import BytesIO
 DATA_PATH = "/app/data/"
 FILE_NAME = "eth_1h_data.csv"
 REPO_NAME = "constantinbender51-cmyk/Models"
-REMOTE_PLOT_PATH = "plot.png"
+REMOTE_PLOT_PATH = "plot/plot.png"
 A = 0.01
 
 def fetch():
