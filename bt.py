@@ -15,7 +15,7 @@ REMOTE_PLOT_PATH = "plot.png"
 
 # A = 0.01. We scale by 100 to work with natural numbers.
 # Threshold A becomes 1 in the scaled domain.
-SCALE_FACTOR = 100 
+SCALE_FACTOR = 50
 A_SCALED = 1 
 
 def fetch():
