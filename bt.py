@@ -37,10 +37,9 @@ def get_model_filename(symbol):
 
 def predict_direction(close_prices, anchor_price, configs):
     """
-    Replication of the inference logic from the uploaded file.
+    Replication of the inference logic.
     """
     prices_arr = np.array(close_prices)
-    # Avoid division by zero or log of zero if data is bad
     if anchor_price <= 0 or np.any(prices_arr <= 0):
         return "NEUTRAL"
 
@@ -62,9 +61,6 @@ def predict_direction(close_prices, anchor_price, configs):
     return "LONG" if (up > 0 and down == 0) else "SHORT" if (down > 0 and up == 0) else "NEUTRAL"
 
 def fetch_history(symbol, since_ts):
-    """
-    Fetches full history from `since_ts` until now using pagination.
-    """
     exchange = ccxt.binance()
     all_ohlcv = []
     
@@ -78,16 +74,13 @@ def fetch_history(symbol, since_ts):
             
             all_ohlcv.extend(ohlcv)
             
-            # Update since_ts to the last timestamp + 1ms to get next page
             last_ts = ohlcv[-1][0]
-            if last_ts == since_ts: # Break if no progress
+            if last_ts == since_ts: 
                 break
             since_ts = last_ts + 1
             
-            # Rate limit sleep
             time.sleep(exchange.rateLimit / 1000)
             
-            # If we reached close to current time, stop
             if last_ts > (time.time() * 1000) - 60000:
                 break
                 
@@ -119,8 +112,12 @@ def run_backtest():
 
     anchor_price = model_data['initial_price']
     configs = model_data['ensemble_configs']
+    
+    # Extract bucketsize (step_size) from the first config for "Flat Outcome" filtering
+    bucket_size = configs[0]['step_size'] if configs else 0.001
+    print(f"[*] Bucket Size (for flat outcome filtering): {bucket_size:.5f}")
 
-    # 3. Fetch Data (From Jan 1, 2024) - MODIFIED HERE
+    # 3. Fetch Data (From Jan 1, 2024)
     start_date = datetime(2024, 1, 1, tzinfo=timezone.utc)
     since_ts = int(start_date.timestamp() * 1000)
     df = fetch_history(selected_asset, since_ts)
@@ -137,23 +134,30 @@ def run_backtest():
     equity_curve = []
     trades = []
     
-    # Warmup buffer
+    # Global Metrics Counters
+    correct_dir = 0
+    total_valid_dir = 0
+    
+    one_pct_wins = 0
+    one_pct_losses = 0
+
     warmup = 50 
     closes = df['close'].values
     timestamps = df['datetime'].values
 
     for i in range(warmup, len(df) - 1):
-        # Input: Historical closes up to index i (inclusive)
         input_series = closes[i-warmup : i+1] 
-        
-        # Predict
         pred = predict_direction(input_series, anchor_price, configs)
         
-        # Trade execution: Enter at close[i], Exit at close[i+1]
         entry_price = closes[i]
         exit_price = closes[i+1]
         ts = timestamps[i+1]
         
+        # Calculate Log Return for Bucket Comparison (Model works in log space)
+        log_return = np.log(exit_price / entry_price)
+        abs_log_return = abs(log_return)
+        
+        # Standard PnL % for Equity
         pnl_pct = 0.0
         
         if pred == "LONG":
@@ -161,26 +165,50 @@ def run_backtest():
         elif pred == "SHORT":
             pnl_pct = (entry_price - exit_price) / entry_price
         
-        # Simple compounding
+        # --- METRIC 1: Directional Accuracy (Filtered) ---
+        if pred != "NEUTRAL":
+            # Ignore outcomes smaller than bucket_size (Flat outcomes)
+            if abs_log_return >= bucket_size:
+                total_valid_dir += 1
+                if pnl_pct > 0:
+                    correct_dir += 1
+        
+        # --- METRIC 2: 1% Accuracy ---
+        if pred != "NEUTRAL":
+            if pnl_pct > 0.01:      # > +1%
+                one_pct_wins += 1
+            elif pnl_pct < -0.01:   # < -1%
+                one_pct_losses += 1
+
+        # Equity Update
         equity = equity * (1 + pnl_pct)
         equity_curve.append({'date': ts, 'equity': equity})
         
-        # Record trade for monthly stats
         if pred != "NEUTRAL":
             trades.append({
                 'date': ts,
                 'pnl': pnl_pct,
-                'win': 1 if pnl_pct > 0 else 0
+                'win': 1 if pnl_pct > 0 else 0,
+                # Store extra data for monthly breakdowns if needed
+                'is_big_win': 1 if pnl_pct > 0.01 else 0,
+                'is_big_loss': 1 if pnl_pct < -0.01 else 0,
+                'valid_dir': 1 if abs_log_return >= bucket_size else 0,
+                'correct_dir': 1 if (abs_log_return >= bucket_size and pnl_pct > 0) else 0
             })
 
-    # 5. Analysis & Plotting
+    # 5. Calculate Final Metrics
+    dir_acc = (correct_dir / total_valid_dir * 100) if total_valid_dir > 0 else 0.0
+    
+    total_one_pct_events = one_pct_wins + one_pct_losses
+    one_pct_acc = (one_pct_wins / total_one_pct_events * 100) if total_one_pct_events > 0 else 0.0
+
+    # 6. Analysis & Plotting
     eq_df = pd.DataFrame(equity_curve)
     trade_df = pd.DataFrame(trades)
     
-    # -- Plotting --
     plt.figure(figsize=(10, 6))
     plt.plot(eq_df['date'], eq_df['equity'], label='Equity ($)', color='blue')
-    plt.title(f"Backtest Equity Curve: {selected_asset} (2024-Now)") # Updated Title
+    plt.title(f"Backtest: {selected_asset} (2024-Now)\nDir Acc: {dir_acc:.2f}% | 1% Acc: {one_pct_acc:.2f}%")
     plt.xlabel("Date")
     plt.ylabel("Equity ($)")
     plt.grid(True, alpha=0.3)
@@ -196,20 +224,31 @@ def run_backtest():
         
         for name, group in grouped:
             total_pnl = group['pnl'].sum() * 100
-            accuracy = (group['win'].sum() / len(group)) * 100
+            
+            # Monthly Directional Acc (Filtered)
+            m_valid = group['valid_dir'].sum()
+            m_correct = group['correct_dir'].sum()
+            m_acc = (m_correct / m_valid * 100) if m_valid > 0 else 0.0
+            
             monthly_stats.append({
                 'month': str(name),
                 'pnl': total_pnl,
-                'accuracy': accuracy,
+                'accuracy': m_acc,
                 'trades': len(group)
             })
 
-    # 6. Generate HTML
-    generate_html(selected_asset, monthly_stats, initial_equity, equity)
+    # 7. Generate HTML
+    global_stats = {
+        "dir_acc": dir_acc,
+        "valid_dir_trades": total_valid_dir,
+        "one_pct_acc": one_pct_acc,
+        "one_pct_count": total_one_pct_events
+    }
+    generate_html(selected_asset, monthly_stats, initial_equity, equity, global_stats)
 
 # --- HTML GENERATION ---
 
-def generate_html(asset, stats, start_eq, end_eq):
+def generate_html(asset, stats, start_eq, end_eq, global_stats):
     rows = ""
     for s in stats:
         color = "green" if s['pnl'] > 0 else "red"
@@ -235,26 +274,50 @@ def generate_html(asset, stats, start_eq, end_eq):
             th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
             th {{ background-color: #f2f2f2; }}
             img {{ max-width: 100%; height: auto; margin-top: 20px; border: 1px solid #ddd; }}
-            .summary {{ background: #f9f9f9; padding: 15px; border-radius: 5px; }}
+            .summary, .metrics {{ background: #f9f9f9; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+            .metric-box {{ display: inline-block; width: 45%; vertical-align: top; }}
         </style>
     </head>
     <body>
         <h1>Backtest Report: {asset}</h1>
+        
         <div class="summary">
+            <h3>General Performance</h3>
             <p><strong>Period:</strong> 2024-01-01 to Present</p>
             <p><strong>Initial Equity:</strong> ${start_eq:.2f}</p>
             <p><strong>Final Equity:</strong> ${end_eq:.2f}</p>
             <p><strong>Total Return:</strong> {total_ret:.2f}%</p>
         </div>
+
+        <div class="metrics">
+            <h3>Advanced Accuracy Metrics</h3>
+            <div class="metric-box">
+                <h4>Directional Accuracy</h4>
+                <p style="font-size: 1.2em; font-weight: bold;">{global_stats['dir_acc']:.2f}%</p>
+                <p style="font-size: 0.8em; color: #555;">
+                    (Correct Predictions / Total Predictions)<br>
+                    <em>*Excludes flat signals and outcomes smaller than bucket size.</em><br>
+                    Sample size: {global_stats['valid_dir_trades']} trades
+                </p>
+            </div>
+            <div class="metric-box">
+                <h4>1% Accuracy</h4>
+                <p style="font-size: 1.2em; font-weight: bold;">{global_stats['one_pct_acc']:.2f}%</p>
+                <p style="font-size: 0.8em; color: #555;">
+                    (Wins > 1%) / (Wins > 1% + Losses < -1%)<br>
+                    Sample size: {global_stats['one_pct_count']} trades
+                </p>
+            </div>
+        </div>
         
         <img src="{PLOT_FILE}" alt="Equity Curve">
         
-        <h2>Monthly Performance</h2>
+        <h2>Monthly Breakdown</h2>
         <table>
             <thead>
                 <tr>
                     <th>Month</th>
-                    <th>Accuracy</th>
+                    <th>Dir. Accuracy</th>
                     <th>Net PnL</th>
                     <th>Trade Count</th>
                 </tr>
@@ -275,7 +338,6 @@ def generate_html(asset, stats, start_eq, end_eq):
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Silence server logs to keep console clean
         pass
 
 def serve():
